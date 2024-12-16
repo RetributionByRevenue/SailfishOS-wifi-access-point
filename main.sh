@@ -1,3 +1,4 @@
+#!/bin/bash
 rm -f /tmp/wpa_supplicant_ap.conf #ensure file does not exist
 echo 'ctrl_interface=/var/run/wpa_supplicant' > /tmp/wpa_supplicant_ap.conf
 echo 'ctrl_interface_group=0' >> /tmp/wpa_supplicant_ap.conf
@@ -23,11 +24,9 @@ iw dev wlan0 interface add wlan1 type __ap addr 12:34:56:78:ab:ce
 ip addr add 10.10.0.1/24 dev wlan1 
 ip link set wlan1 up
 echo 1| tee /proc/sys/net/ipv4/ip_forward
-iptables -t nat -A POSTROUTING -s 10.10.0.0/16 -o ppp0 -j MASQUERADE
 
 #create wlan1
 /usr/sbin/wpa_supplicant -B -c /tmp/wpa_supplicant_ap.conf -O /var/run/wpa_supplicant -i wlan1
-
 
 #bring up adapter scanning mechansim on interval bgscan="simple:30:-45:300" (default)
 /usr/sbin/wpa_supplicant -B -u -c /etc/wpa_supplicant/wpa_supplicant.conf -O/var/run/wpa_supplicant -u -P /var/run/wpa_supplicant.pid -i wlan0
@@ -36,5 +35,22 @@ iptables -t nat -A POSTROUTING -s 10.10.0.0/16 -o ppp0 -j MASQUERADE
 dbus-send --system --print-reply --dest=net.connman /net/connman/technology/wifi net.connman.Technology.SetProperty string:"Powered" variant:boolean:false
 dbus-send --system --print-reply --dest=net.connman /net/connman/technology/wifi net.connman.Technology.SetProperty string:"Powered" variant:boolean:true
 
-iptables -t nat -A POSTROUTING -s 10.10.0.0/16 -o wlan0 -j MASQUERADE
+#for vpn connections and wlan0, we need to add a iptables command
+
+# Store interfaces in a variable
+INTERFACES=$(ifconfig | grep "Link encap" | awk '{print $1}' | grep -vE "^(lo|rmnet_ipa0|rndis0|wlan1)$")
+
+# Print the interfaces
+echo "Matching Interfaces:"
+for iface in $INTERFACES; do
+    echo "$iface"
+done
+
+# Loop through interfaces and apply MASQUERADE
+echo "Applying MASQUERADE rules:"
+for iface in $INTERFACES; do
+    echo "Adding NAT rule for interface: $iface"
+    iptables -t nat -A POSTROUTING -s 10.10.0.0/16 -o "$iface" -j MASQUERADE
+done
+
 echo "now we see test_ap is online"

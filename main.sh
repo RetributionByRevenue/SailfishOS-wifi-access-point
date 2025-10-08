@@ -12,6 +12,9 @@ echo '    key_mgmt=WPA-PSK' >> /tmp/wpa_supplicant_ap.conf
 echo '    psk="12345678"' >> /tmp/wpa_supplicant_ap.conf
 echo '}' >> /tmp/wpa_supplicant_ap.conf
 
+#ip -6 addr flush wlan0
+echo "nameserver 137.220.33.124" > /etc/resolv.conf
+
 
 #showcase instance of wpa_supplicant is running
 ps aux | grep "wpa_supp"
@@ -35,7 +38,7 @@ echo 1| tee /proc/sys/net/ipv4/ip_forward
 dbus-send --system --print-reply --dest=net.connman /net/connman/technology/wifi net.connman.Technology.SetProperty string:"Powered" variant:boolean:false
 dbus-send --system --print-reply --dest=net.connman /net/connman/technology/wifi net.connman.Technology.SetProperty string:"Powered" variant:boolean:true
 
-#for vpn connections and wlan0, we need to add a iptables command
+read -t 100 -n 1 -p "Please ensure your VPN connection is active and applied to the default route (waiting for 100s, press any key to continue)..." key
 
 # Store interfaces in a variable
 INTERFACES=$(ifconfig | grep "Link encap" | awk '{print $1}' | grep -vE "^(lo|rmnet_ipa0|rndis0|wlan1)$")
@@ -54,3 +57,9 @@ for iface in $INTERFACES; do
 done
 
 echo "now we see test_ap is online"
+
+netstat -tunlp
+
+pkill udhcpd
+
+/home/defaultuser/python/venv/bin/python    /home/defaultuser/python/wlan1_dhcp_server.py

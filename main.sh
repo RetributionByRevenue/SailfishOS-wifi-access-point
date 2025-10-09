@@ -13,6 +13,7 @@ echo '    psk="12345678"' >> /tmp/wpa_supplicant_ap.conf
 echo '}' >> /tmp/wpa_supplicant_ap.conf
 
 
+
 #showcase instance of wpa_supplicant is running
 ps aux | grep "wpa_supp"
 
@@ -35,18 +36,47 @@ echo 1| tee /proc/sys/net/ipv4/ip_forward
 dbus-send --system --print-reply --dest=net.connman /net/connman/technology/wifi net.connman.Technology.SetProperty string:"Powered" variant:boolean:false
 dbus-send --system --print-reply --dest=net.connman /net/connman/technology/wifi net.connman.Technology.SetProperty string:"Powered" variant:boolean:true
 
-read -t 100 -n 1 -p "Please ensure your VPN connection is active and applied to the default route (waiting for 100s, press any key to continue)..." key
+while true; do
+  echo "Choose an option:"
+  echo "1) Openvpn"
+  echo "2) Wireguard"
+  echo "3) Exit"
+  read -r choice
+
+  if [ "$choice" = "1" ]; then
+    echo "OpenVpn Selected"
+    nohup openvpn --dev tun --config /home/defaultuser/Desktop/mark-phone.ovpn >/dev/null 2>&1 &
+    echo "created tun0 device and sleep for 30s"
+    sleep 30
+    ip route del default && ip route add default dev tun0
+    nohup sh -c 'while :; do if ping -I tun0 -c 10 8.8.8.8 >/dev/null 2>&1; then echo 255 | tee /sys/class/leds/red/brightness; else echo 0 | sudo tee /sys/class/leds/red/brightness; fi; sleep 4; done' >/dev/null 2>&1 &
+    #break
+    break
+
+  elif [ "$choice" = "2" ]; then
+    echo "Wireguard Selected!"
+    read -t 100 -n 1 -p "Please ensure the wireguard VPN connection is active and applied to the default route (waiting for 100s, press any key to continue)..." key
+    echo
+    break
+
+  elif [ "$choice" = "3" ]; then
+    echo "Exiting..."
+    break
+
+  else
+    echo "Invalid option. Try again."
+  fi
+done
 
 for iface in $(ifconfig | grep "Link encap" | awk '{print $1}' | grep -vE "^(lo|rmnet_ipa0|rndis0|wlan1)$"); do
-  echo "$iface"
+  echo "modifying $iface"
   iptables -t nat -A POSTROUTING -s 10.10.0.0/16 -o "$iface" -j MASQUERADE
 done
 
 echo "now we see test_ap is online"
 
-netstat -tunlp
+netstat -nr  
 
 pkill udhcpd
 
 /home/defaultuser/python/venv/bin/python    /home/defaultuser/python/wlan1_dhcp_server.py
-

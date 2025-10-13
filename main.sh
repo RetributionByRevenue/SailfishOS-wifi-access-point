@@ -38,25 +38,27 @@ dbus-send --system --print-reply --dest=net.connman /net/connman/technology/wifi
 
 while true; do
   echo "Choose an option:"
-  echo "1) Openvpn"
-  echo "2) Wireguard"
+  echo "1) Openvpn My VPS"
+  echo "2) Openvpn Nordvpn"
   echo "3) Exit"
   read -r choice
 
   if [ "$choice" = "1" ]; then
-    echo "OpenVpn Selected"
+    echo "Openvpn My VPS"
     nohup openvpn --dev tun --config /home/defaultuser/Desktop/mark-phone.ovpn >/dev/null 2>&1 &
     echo "created tun0 device and sleep for 30s"
     sleep 30
     ip route del default && ip route add default dev tun0
-    nohup sh -c 'while :; do if ping -I tun0 -c 10 8.8.8.8 >/dev/null 2>&1; then echo 255 | tee /sys/class/leds/red/brightness; else echo 0 | sudo tee /sys/class/leds/red/brightness; fi; sleep 4; done' >/dev/null 2>&1 &
-    #break
+    nohup sh -c 'while :; do if ping -I tun0 -c 10 8.8.8.8 >/dev/null 2>&1; then echo 255 | tee /sys/class/leds/blue/brightness; else echo 0 | sudo tee /sys/class/leds/blue/brightness; fi; sleep 4; done' >/dev/null 2>&1 &
     break
 
   elif [ "$choice" = "2" ]; then
-    echo "Wireguard Selected!"
-    read -t 100 -n 1 -p "Please ensure the wireguard VPN connection is active and applied to the default route (waiting for 100s, press any key to continue)..." key
-    echo
+    echo "Openvpn Nordvpn"
+    nohup openvpn --dev tun --config /home/defaultuser/Desktop/nord-vancouver-openvpn.ovpn >/dev/null 2>&1 &
+    echo "created tun0 device and sleep for 30s"
+    sleep 30
+    ip route del default && ip route add default dev tun0
+    nohup sh -c 'while :; do if ping -I tun0 -c 10 8.8.8.8 >/dev/null 2>&1; then echo 255 | tee /sys/class/leds/blue/brightness; else echo 0 | sudo tee /sys/class/leds/blue/brightness; fi; sleep 4; done' >/dev/null 2>&1 &
     break
 
   elif [ "$choice" = "3" ]; then

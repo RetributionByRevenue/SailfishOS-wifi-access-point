@@ -39,8 +39,9 @@ dbus-send --system --print-reply --dest=net.connman /net/connman/technology/wifi
 while true; do
   echo "Choose an option:"
   echo "1) Openvpn My VPS"
-  echo "2) Openvpn Nordvpn"
-  echo "3) Exit"
+  echo "2) Openvpn Nordvpn Vancouver"
+  echo "3) Openvpn Nordvpn Seattle"
+  echo "4) Exit"
   read -r choice
 
   if [ "$choice" = "1" ]; then
@@ -62,6 +63,15 @@ while true; do
     break
 
   elif [ "$choice" = "3" ]; then
+    echo "Openvpn Nordvpn"
+    nohup openvpn --dev tun --config /home/defaultuser/Desktop/nord-seattle-openvpn.ovpn >/dev/null 2>&1 &
+    echo "created tun0 device and sleep for 30s"
+    sleep 30
+    ip route del default && ip route add default dev tun0
+    nohup sh -c 'while :; do if ping -I tun0 -c 10 8.8.8.8 >/dev/null 2>&1; then echo 255 | tee /sys/class/leds/blue/brightness; else echo 0 | sudo tee /sys/class/leds/blue/brightness; fi; sleep 4; done' >/dev/null 2>&1 &
+    break
+
+  elif [ "$choice" = "4" ]; then
     echo "Exiting..."
     break
 

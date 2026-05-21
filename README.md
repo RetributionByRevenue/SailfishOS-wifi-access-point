@@ -44,19 +44,52 @@ iptables -A FORWARD -i wlan1 ! -o tun+ -j DROP
 
 Read literally: **any packet entering from `wlan1` whose outgoing interface is not a `tun*` device gets dropped, period.**
 
-This rule is *stateless* and *always-on*. It doesn't care what phase the script is in, whether the VPN is up, restarting, dead, or never started. The implications across every realistic failure mode:
+This rule is *stateless* and *always-on*. It doesn't care what phase the script is in, whether the VPN is up, restarting, dead, or never started. The implications across every realistic failure mode are walked through below.
 
-| Scenario | Kill switch effect |
-|---|---|
-| Script just started, no `tun0` yet | All `wlan1` traffic dropped → fail-closed during setup |
-| VPN tunnel up, normal operation | `wlan1 → tun0` allowed; `wlan1 → wlan0` dropped → no leak |
-| Modem outage, openvpn retrying | `tun0` still exists, can't deliver → packets fail silently |
-| openvpn crashes, `tun0` gone | All `wlan1` traffic instantly drops → no exposure window |
-| Routes get reshuffled by ConnMan | Rule keys on *interface*, not routing → still safe |
+**Scenario A — Script just started, no `tun0` yet (setup window)**
+
+1. AP `test_ap` is on the air the moment `wpa_supplicant -i wlan1` starts.
+2. A client may try to associate before openvpn finishes negotiating.
+3. `tun0` does not exist yet — there is no `tun+` device the kernel can egress through.
+4. Kill switch matches `-i wlan1 ! -o tun+` → every packet from `wlan1` is dropped.
+5. No leak. Client sits with no internet until the readiness probe completes.
+
+**Scenario B — VPN tunnel up, steady-state operation**
+
+1. `tun0` exists and carries traffic; the default route is `dev tun0`.
+2. AP client sends a packet → enters `wlan1`.
+3. Kernel chooses egress interface = `tun0` based on the default route.
+4. Kill switch sees egress is `tun+` → ACCEPT.
+5. Packet leaves through the VPN. Reply returns via `tun0` → conntrack delivers it back to the client.
+
+**Scenario C — Modem outage, openvpn retrying**
+
+1. Modem dies → openvpn's `keepalive 10 60` times out within ~60 s and marks the peer dead.
+2. `tun0` stays in the kernel (`persist-tun`) but stops delivering packets.
+3. AP client traffic still enters `wlan1`, kernel still routes via `tun0`, kill switch still ACCEPTs.
+4. Packets reach `tun0` but openvpn cannot transmit them → they fail silently at the tunnel layer.
+5. Modem returns → openvpn's next retry succeeds → traffic resumes automatically. No leak occurred; no script action needed.
+
+**Scenario D — openvpn crashes, `tun0` disappears**
+
+1. openvpn exits unexpectedly (crash, OOM, manual kill).
+2. Kernel removes the `tun0` device.
+3. The default route that pointed at `tun0` is now invalid; kernel falls back to the next available default (typically `default via <gateway> dev wlan0`).
+4. AP client packet enters `wlan1`, kernel tries to route it out `wlan0`.
+5. Kill switch matches `-i wlan1 ! -o tun+` → `wlan0` is not a `tun+` device → DROP. No exposure window.
+
+**Scenario E — Routes get reshuffled by ConnMan**
+
+1. ConnMan adds, replaces, or removes a route as part of its normal state management.
+2. The default route may briefly point at `wlan0` instead of `tun0`.
+3. AP client packet enters `wlan1`, kernel selects egress = `wlan0`.
+4. Kill switch matches on egress interface → `wlan0 ≠ tun+` → DROP.
+5. Routing-table churn cannot create a leak, because the rule keys on the interface name, not on the route or destination.
 
 There is no point in time, including the VPN-handshake window, where an AP client can send a packet out via `wlan0` or cellular. The original 30 s blind sleep used to be an exposure window; the kill switch closes it permanently.
 
 Compare to a routing-only approach (just changing the default route to `tun0`): if the route is removed for any reason (interface down, ConnMan re-adding its own default, openvpn exiting), traffic falls back to whatever default route exists — typically the real upstream. The kill switch is independent of routing; it survives all that.
+
 
 ---
 

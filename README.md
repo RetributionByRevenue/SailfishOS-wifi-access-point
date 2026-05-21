@@ -1,4 +1,5 @@
 # SailfishOS Wi-Fi Access Point + VPN Travel Router
+<img width="270" height="630" alt="image" src="https://github.com/user-attachments/assets/609b6ba9-7e19-456d-ae1e-6df5ea30f7c9" />
 
 Turn a SailfishOS phone into a discreet Wi-Fi access point whose clients are routed exclusively through an OpenVPN tunnel — with a permanent, stateless kill switch that prevents any AP client traffic from leaking outside the tunnel, even during VPN setup, outages, or reconnects.
 

@@ -61,6 +61,17 @@ Throughout every step of that recovery, the leak guard stays in place, so AP cli
 
 ---
 
+## Real-world deployment
+
+This runs in production across roughly half the planet:
+
+- **VPN server:** OpenVPN Access Server on an **Ubuntu 20.04 laptop in Canada**.
+- **Travel router:** a **SailfishOS phone in Malaysia** connects out to that server as the OpenVPN client and re-shares the tunnel over its `test_ap` Wi-Fi.
+
+Despite the Malaysia → Canada round trip (~half the globe), an AP client measured **~23 Mbps down / ~44 Mbps up** on a Google Fiber speed test through the tunnel — comfortably enough for browsing, streaming, and video calls. The auto-reconnect has also been observed recovering live: on an upstream Wi-Fi drop the dashboard flipped to `RECONNECTING` and back to `HEALTHY` on its own, with no keypress.
+
+---
+
 ## Anti-leak design (how it doesn't leak)
 
 The script installs one iptables rule — the **leak guard** — and never removes it during normal operation:

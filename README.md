@@ -1,5 +1,5 @@
 # SailfishOS Wi-Fi Access Point + VPN Travel Router
-<img width="270" height="630" alt="image" src="https://github.com/user-attachments/assets/609b6ba9-7e19-456d-ae1e-6df5ea30f7c9" />
+<img width="270" height="630" alt="image" src="https://raw.githubusercontent.com/RetributionByRevenue/SailfishOS-wifi-access-point/refs/heads/main/SAILFISH%20TRAVEL%20ROUTER%20TUI.png" />
 
 Turn a SailfishOS phone into a discreet Wi-Fi access point whose clients are routed exclusively through an OpenVPN tunnel — with a permanent, stateless **leak guard** (an always-on iptables rule) that prevents any AP client traffic from leaking outside the tunnel, even during VPN setup, outages, or reconnects. A background **supervisor** actively re-establishes the tunnel when upstream Wi-Fi drops, all driven from a live full-screen dashboard.
 

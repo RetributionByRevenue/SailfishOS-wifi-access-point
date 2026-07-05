@@ -1,7 +1,7 @@
 # SailfishOS Wi-Fi Access Point + VPN Travel Router
 <img width="270" height="630" alt="image" src="https://github.com/user-attachments/assets/609b6ba9-7e19-456d-ae1e-6df5ea30f7c9" />
 
-Turn a SailfishOS phone into a discreet Wi-Fi access point whose clients are routed exclusively through an OpenVPN tunnel — with a permanent, stateless kill switch that prevents any AP client traffic from leaking outside the tunnel, even during VPN setup, outages, or reconnects.
+Turn a SailfishOS phone into a discreet Wi-Fi access point whose clients are routed exclusively through an OpenVPN tunnel — with a permanent, stateless **leak guard** (an always-on iptables rule) that prevents any AP client traffic from leaking outside the tunnel, even during VPN setup, outages, or reconnects. A background **supervisor** actively re-establishes the tunnel when upstream Wi-Fi drops, all driven from a live full-screen dashboard.
 
 <img src=https://raw.githubusercontent.com/RetributionByRevenue/SailfishOS-wifi-access-point/refs/heads/main/wifi.PNG>
 
@@ -20,7 +20,7 @@ A small Python DHCP server (built on Scapy) hands out leases to AP clients. You 
    AP client  --->  | wlan1 (test_ap)        |  10.10.0.0/24
    (10.10.0.x)      |   |                    |
                     |   v                    |
-                    | iptables FORWARD       |   <-- kill switch lives here
+                    | iptables FORWARD       |   <-- leak guard lives here
                     |   |                    |
                     |   v                    |
                     | tun0 (OpenVPN)         |  <-- only allowed egress
@@ -34,9 +34,36 @@ The only allowed exit for AP traffic is `tun0`. Every other egress path is dropp
 
 ---
 
+## Live dashboard + self-healing supervisor
+
+Running `main.sh` brings the router up through a sequence of steps and then drops you into a **full-screen live dashboard** — pure bash + ANSI, no external packages. It shows, refreshed once per second:
+
+- a big colour-coded **VPN TUNNEL** banner (`HEALTHY` / `RECONNECTING` / `DOWN`),
+- status dots for upstream Wi-Fi (with SSID), `tun0`, the AP, the leak guard, the default route, and the DHCP server,
+- a rolling event log of the most recent actions.
+
+Hotkeys:
+
+| Key | Action |
+| --- | --- |
+| `r` | Force an immediate VPN reconnect |
+| `q` | Tear everything down and quit (confirms first). `2` also works. |
+
+Behind the dashboard runs the **supervisor** — a background process that continuously verifies the tunnel actually *passes traffic* (`ping -I tun0 8.8.8.8`), not merely that `tun0` exists. When the check fails — which is exactly what happens when upstream Wi-Fi drops or roams — it:
+
+1. kills `openvpn` and cleans up the stale `tun0`,
+2. waits until `wlan0` is genuinely back (`ping -I wlan0` succeeds),
+3. redials the VPN (using the upstream gateway captured at setup so it can reach the server),
+4. restores the default route through `tun0`,
+5. drives the blue LED as a live health light.
+
+Throughout every step of that recovery, the leak guard stays in place, so AP clients remain **fail-closed** — there is no window in which their traffic can escape untunnelled. The supervisor survives a terminal hangup (e.g. an SSH drop), so the router keeps healing itself even if you disconnect; re-run the script to reattach the dashboard.
+
+---
+
 ## Anti-leak design (how it doesn't leak)
 
-The hardened script installs one iptables rule and never removes it during normal operation:
+The script installs one iptables rule — the **leak guard** — and never removes it during normal operation:
 
 ```bash
 iptables -A FORWARD -i wlan1 ! -o tun+ -j DROP
@@ -51,7 +78,7 @@ This rule is *stateless* and *always-on*. It doesn't care what phase the script 
 1. AP `test_ap` is on the air the moment `wpa_supplicant -i wlan1` starts.
 2. A client may try to associate before openvpn finishes negotiating.
 3. `tun0` does not exist yet — there is no `tun+` device the kernel can egress through.
-4. Kill switch matches `-i wlan1 ! -o tun+` → every packet from `wlan1` is dropped.
+4. Leak guard matches `-i wlan1 ! -o tun+` → every packet from `wlan1` is dropped.
 5. No leak. Client sits with no internet until the readiness probe completes.
 
 **Scenario B — VPN tunnel up, steady-state operation**
@@ -59,63 +86,68 @@ This rule is *stateless* and *always-on*. It doesn't care what phase the script 
 1. `tun0` exists and carries traffic; the default route is `dev tun0`.
 2. AP client sends a packet → enters `wlan1`.
 3. Kernel chooses egress interface = `tun0` based on the default route.
-4. Kill switch sees egress is `tun+` → ACCEPT.
+4. Leak guard sees egress is `tun+` → ACCEPT.
 5. Packet leaves through the VPN. Reply returns via `tun0` → conntrack delivers it back to the client.
 
-**Scenario C — Modem outage, openvpn retrying**
+**Scenario C — Modem outage, tunnel stops passing traffic**
 
-1. Modem dies → openvpn's `keepalive 10 60` times out within ~60 s and marks the peer dead.
-2. `tun0` stays in the kernel (`persist-tun`) but stops delivering packets.
-3. AP client traffic still enters `wlan1`, kernel still routes via `tun0`, kill switch still ACCEPTs.
-4. Packets reach `tun0` but openvpn cannot transmit them → they fail silently at the tunnel layer.
-5. Modem returns → openvpn's next retry succeeds → traffic resumes automatically. No leak occurred; no script action needed.
+1. The upstream link dies; packets stop flowing through `tun0`.
+2. The supervisor's `ping -I tun0` starts failing, so within one poll cycle it declares the tunnel down.
+3. It kills openvpn, waits for `wlan0` to recover, then redials and restores the `tun0` default route.
+4. AP client traffic keeps entering `wlan1` the whole time, but with no working `tun+` egress the leak guard drops it. No leak occurred; recovery is automatic.
 
 **Scenario D — openvpn crashes, `tun0` disappears**
 
 1. openvpn exits unexpectedly (crash, OOM, manual kill).
-2. Kernel removes the `tun0` device.
-3. The default route that pointed at `tun0` is now invalid; kernel falls back to the next available default (typically `default via <gateway> dev wlan0`).
-4. AP client packet enters `wlan1`, kernel tries to route it out `wlan0`.
-5. Kill switch matches `-i wlan1 ! -o tun+` → `wlan0` is not a `tun+` device → DROP. No exposure window.
+2. Kernel removes the `tun0` device; the default route that pointed at it becomes invalid and falls back to `default via <gateway> dev wlan0`.
+3. AP client packet enters `wlan1`, kernel tries to route it out `wlan0`.
+4. Leak guard matches `-i wlan1 ! -o tun+` → `wlan0` is not a `tun+` device → DROP. No exposure window.
+5. The supervisor notices `tun0` is gone and redials.
 
 **Scenario E — Routes get reshuffled by ConnMan**
 
 1. ConnMan adds, replaces, or removes a route as part of its normal state management.
 2. The default route may briefly point at `wlan0` instead of `tun0`.
 3. AP client packet enters `wlan1`, kernel selects egress = `wlan0`.
-4. Kill switch matches on egress interface → `wlan0 ≠ tun+` → DROP.
-5. Routing-table churn cannot create a leak, because the rule keys on the interface name, not on the route or destination.
+4. Leak guard matches on egress interface → `wlan0 ≠ tun+` → DROP.
+5. Routing-table churn cannot create a leak, because the rule keys on the interface name, not on the route or destination. (The supervisor also re-pins the default route back onto `tun0` after any reconnect.)
 
-There is no point in time, including the VPN-handshake window, where an AP client can send a packet out via `wlan0` or cellular. The original 30 s blind sleep used to be an exposure window; the kill switch closes it permanently.
+**Scenario F — Upstream Wi-Fi disconnects or roams to a new network**
 
-Compare to a routing-only approach (just changing the default route to `tun0`): if the route is removed for any reason (interface down, ConnMan re-adding its own default, openvpn exiting), traffic falls back to whatever default route exists — typically the real upstream. The kill switch is independent of routing; it survives all that.
+1. You leave the café / the AP vanishes / the phone re-associates to a different SSID. `wlan0` briefly loses connectivity.
+2. The tunnel stops passing traffic; the supervisor kills openvpn, waits for `wlan0` to reassociate and become reachable, then redials the VPN on the new upstream.
+3. During the entire gap, AP client traffic has no `tun+` egress → leak guard drops it.
+4. Once the tunnel is back, the supervisor restores the `tun0` default route and clients resume — no manual action needed.
 
+There is no point in time, including the VPN-handshake window and any reconnect, where an AP client can send a packet out via `wlan0` or cellular. The leak guard is independent of routing; it survives all the churn above.
+
+Compare to a routing-only approach (just changing the default route to `tun0`): if the route is removed for any reason (interface down, ConnMan re-adding its own default, openvpn exiting), traffic falls back to whatever default route exists — typically the real upstream. The leak guard is independent of routing; it survives all that.
 
 ---
 
 ## Other features
 
-**Active VPN readiness probe** — instead of `sleep 30`, the script polls `ip link show tun0 up` AND `ping -I tun0 8.8.8.8` once per second for up to 600 s. The script proceeds only when the tunnel is verified end-to-end reachable.
+**Active VPN readiness probe** — instead of a blind `sleep`, the script polls `ip link show tun0 up` **and** `ping -I tun0 8.8.8.8` once per second (up to 600 s on first dial, 90 s per reconnect). It proceeds only when the tunnel is verified end-to-end reachable.
 
-**Glanceable physical status indicator** — a background daemon pings `8.8.8.8` every few seconds. The phone's blue LED is solid when the path to the internet is alive and dark when ping shows 100% packet loss. Lets you see at a glance whether your travel router is working without unlocking the phone.
+**Glanceable physical status indicator** — the supervisor drives the phone's blue LED: solid when the tunnel is verified healthy, dark when it isn't. Lets you see at a glance whether your travel router is working without unlocking the phone.
 
-**Step-by-step progress trace** — every phase of setup and teardown prints a numbered cyan banner (`==> step N/15: ...`) so you can see exactly what's happening and where any failure occurred.
+**Live dashboard** — a full-screen, colour-coded status view refreshed once per second, replacing the old linear step-banner output. Every setup and teardown action is also written to a rolling event log shown at the bottom.
 
-**Clean teardown** — pressing `2` at the prompt at the end runs a 9-step reset: kills the DHCP server, LED daemon, wpa_supplicants, and openvpn; flushes iptables (NAT + FORWARD); restores `FORWARD` policy to `ACCEPT`; removes `tun0`; deletes the virtual `wlan1`; flushes residual routes; disables IP forwarding; restarts the normal client `wpa_supplicant` on `wlan0`; toggles ConnMan; and turns off the LED. Returns the phone to plain-Wi-Fi-client state, ready for normal use.
+**Clean teardown** — pressing `q` (or `2`) and confirming runs a full reset: stops the supervisor; kills the DHCP server, both wpa_supplicants, and openvpn; flushes iptables (NAT + FORWARD) and restores the `FORWARD` policy to `ACCEPT`; removes `tun0`; deletes the virtual `wlan1`; flushes residual routes; disables IP forwarding; restarts the normal client `wpa_supplicant` on `wlan0`; toggles ConnMan; and turns off the LED. Returns the phone to plain-Wi-Fi-client state, ready for normal use.
 
-**Self-healing for ordinary outages** — when the modem goes down or your ISP hiccups, the OpenVPN Access Server-style `.ovpn` directives (`keepalive 10 60`, `persist-tun`, `persist-key`, `resolv-retry infinite`) handle reconnection automatically. No script intervention needed. Kill switch keeps you safe during the gap.
+**Active self-healing** — the supervisor deterministically re-establishes the tunnel after upstream outages, roams, and crashes (see the scenarios above), rather than relying solely on OpenVPN's own `keepalive` / `persist-tun` retries. The leak guard keeps you safe during the gap.
 
-**No log accumulation** — every background process (`openvpn`, the LED daemon, the DHCP server) has `>/dev/null 2>&1` on its launch line. `nohup.out` is not created. journald entries from `wpa_supplicant` are bounded by systemd's `SystemMaxUse`.
+**Portable shell** — the script avoids bash-only syntax and runs cleanly under `bash`, `dash`, and busybox `ash`, so it works whether you launch it with `./main.sh` or `sh main.sh`.
 
-**Tight, readable output** — the post-setup `netstat -nr` is filtered through `awk` to drop the noisy MSS / Window / irtt columns and aligned to fit IPv4 + CIDR notation cleanly.
+**No log accumulation** — every background process (`openvpn`, the DHCP server) is launched with `>/dev/null 2>&1` and `nohup`; `nohup.out` is not created. The event log lives in `/tmp/travelrouter/` and is trimmed automatically so an all-night session can't fill the disk.
 
 ---
 
 ## What requires user attention
 
-Only one common operation isn't auto-recovered: **toggling Wi-Fi off and on via the phone's UI**. ConnMan tears down both `wpa_supplicant` instances when Wi-Fi is disabled, destroying the virtual `wlan1` AP entirely. ConnMan does not know how to recreate it on re-enable. To recover, press `2` to reset cleanly, then re-run the script.
+Only one common operation isn't auto-recovered: **toggling Wi-Fi off and on via the phone's UI**. Disabling Wi-Fi tears down both `wpa_supplicant` instances and destroys the virtual `wlan1` AP entirely, and ConnMan does not know how to recreate it on re-enable. To recover, press `q` to reset cleanly, then re-run the script.
 
-A real internet outage (modem off, ISP down, VPN server unreachable) does *not* require attention — see the table above.
+Ordinary internet outages and upstream Wi-Fi drops/roams do *not* require attention — the supervisor handles them (see the scenarios above).
 
 ---
 
@@ -127,28 +159,22 @@ A real internet outage (modem off, ISP down, VPN server unreachable) does *not* 
 - A Python virtual environment at `/home/defaultuser/python/venv/` with `scapy` installed.
 - `wlan1_dhcp_server.py` at `/home/defaultuser/python/wlan1_dhcp_server.py`.
 
+Paths, SSID/PSK, and timeouts are configurable at the top of `main.sh`.
+
 ---
 
 ## Usage
 
 ```bash
 # as root
-sh main_secure.sh
+devel-su ./main.sh
 ```
 
-Watch the 15 colored step banners scroll by. When you see:
+The setup steps scroll by, then the live dashboard takes over. Once the **VPN TUNNEL** banner reads `HEALTHY`, your travel router is live — connect any client to SSID `test_ap` (PSK `12345678`) and it will egress through the VPN tunnel.
 
-```
-VPN is up -- AP clients will reach internet via tun0
-```
+From the dashboard:
 
-…your travel router is live. Connect any client to SSID `test_ap` (PSK `12345678`) and it will egress through the VPN tunnel.
+- press `r` to force an immediate reconnect,
+- press `q` (or `2`) and confirm to tear everything down and return the phone to normal client-only state.
 
-When you're done:
-
-```
-Press 2 to reset phone networking (undo all script changes), anything else to ignore:
-2
-```
-
-Phone returns to normal client-only state.
+If you close the dashboard without tearing down (e.g. an SSH drop), the router and its supervisor keep running; re-run the script to reattach.

@@ -1,5 +1,4 @@
 # SailfishOS Wi-Fi Access Point + VPN Travel Router
-<img width="270" height="630" alt="image" src="https://raw.githubusercontent.com/RetributionByRevenue/SailfishOS-wifi-access-point/refs/heads/main/SAILFISH%20TRAVEL%20ROUTER%20TUI.png" />
 
 Turn a SailfishOS phone into a discreet Wi-Fi access point whose clients are routed exclusively through an OpenVPN tunnel — with a permanent, stateless **leak guard** (an always-on iptables rule) that prevents any AP client traffic from leaking outside the tunnel, even during VPN setup, outages, or reconnects. A background **supervisor** actively re-establishes the tunnel when upstream Wi-Fi drops, all driven from a live full-screen dashboard.
 
@@ -7,9 +6,7 @@ Turn a SailfishOS phone into a discreet Wi-Fi access point whose clients are rou
 
 The phone's Wi-Fi chip is operated in concurrent station + AP mode. `wlan0` connects upstream as a normal client; a virtual `wlan1` interface is created on the same radio and runs in AP mode, broadcasting `test_ap` on the `10.10.0.0/24` subnet.
 
-<img src="https://github.com/RetributionByRevenue/SailfishOS-wifi-access-point/blob/main/wlan1_dhcp_server%20screenshot.PNG?raw=true">
-
-A small Python DHCP server (built on Scapy) hands out leases to AP clients. You will need to create a Python virtual environment and `pip install scapy` for this piece.
+A small Python DHCP server hands out leases to AP clients. It is standard library only — a UDP socket plus `struct` — so there is no virtual environment and nothing to `pip install`. The socket is pinned to the AP interface with `SO_BINDTODEVICE`, so the server can only ever answer DISCOVERs arriving on `wlan1`; it will never respond on the upstream network you are attached to.
 
 ---
 
@@ -34,9 +31,60 @@ The only allowed exit for AP traffic is `tun0`. Every other egress path is dropp
 
 ---
 
+## Architecture
+
+Full wiring of the live deployment — an AP client's packet flows down the left, gets gated by the leak guard, enters the OpenVPN tunnel, and only leaves the phone (encrypted, over `wlan0`) once it's bound for `tun+`. The supervisor watches the tunnel out of band and rebuilds it on failure.
+
+```mermaid
+flowchart TB
+    subgraph clients["AP clients · 10.10.0.x"]
+        C["laptop / phone / tablet"]
+    end
+
+    subgraph phone["SailfishOS phone · Malaysia"]
+        direction TB
+        WLAN1["wlan1 — AP<br/>SSID test_ap<br/>gateway 10.10.0.1/24"]
+        DHCP["DHCP server thread<br/>stdlib socket, bound to wlan1"]
+        LG{"iptables FORWARD<br/>leak guard<br/>from wlan1, not out tun+ = DROP"}
+        TUN0["tun0 — OpenVPN client"]
+        NAT["NAT MASQUERADE<br/>src 10.10.0.0/16"]
+        WLAN0["wlan0 — station<br/>upstream Wi-Fi client"]
+        SUP(["supervisor<br/>ping -I tun0 every 4s<br/>kill + redial on failure"])
+    end
+
+    NET(("public Internet"))
+
+    subgraph canada["Ubuntu 20.04 laptop · Canada"]
+        AS["OpenVPN Access Server"]
+    end
+
+    EXIT(("Internet · VPN exit"))
+
+    C -. "DHCP lease" .-> DHCP
+    C == "client traffic" ==> WLAN1
+    WLAN1 ==> LG
+    LG == "egress via tun+ (allowed)" ==> TUN0
+    LG -. "any other egress" .-> X["DROP · fail-closed"]
+    TUN0 ==> NAT
+    NAT ==> WLAN0
+    WLAN0 == "encrypted tunnel" ==> NET
+    NET ==> AS
+    AS ==> EXIT
+
+    SUP -. monitors .-> TUN0
+    SUP -. monitors .-> WLAN0
+
+    classDef guard fill:#fdecea,stroke:#c0392b,color:#111;
+    classDef drop fill:#f8d7da,stroke:#842029,color:#842029;
+    class LG guard;
+    class X drop;
+```
+
+---
+
 ## Live dashboard + self-healing supervisor
 
-Running `main.sh` brings the router up through a sequence of steps and then drops you into a **full-screen live dashboard** — pure bash + ANSI, no external packages. It shows, refreshed once per second:
+Running `router.py` brings the router up through a sequence of steps and then drops you into a **full-screen live dashboard** — pure ANSI, no curses, no external packages. It shows, refreshed once per second:
 
 - a big colour-coded **VPN TUNNEL** banner (`HEALTHY` / `RECONNECTING` / `DOWN`),
 - status dots for upstream Wi-Fi (with SSID), `tun0`, the AP, the leak guard, the default route, and the DHCP server,
@@ -148,9 +196,9 @@ Compare to a routing-only approach (just changing the default route to `tun0`): 
 
 **Active self-healing** — the supervisor deterministically re-establishes the tunnel after upstream outages, roams, and crashes (see the scenarios above), rather than relying solely on OpenVPN's own `keepalive` / `persist-tun` retries. The leak guard keeps you safe during the gap.
 
-**Portable shell** — the script avoids bash-only syntax and runs cleanly under `bash`, `dash`, and busybox `ash`, so it works whether you launch it with `./main.sh` or `sh main.sh`.
+**One file, zero dependencies** — the whole router is a single `router.py` running on the `python3` SailfishOS already ships: one process with three threads (dashboard, DHCP server, VPN supervisor). Device work is shelled out to `iw`, `ip`, `iptables`, `wpa_supplicant`, `openvpn` and `dbus-send`. Nothing to install, nothing to keep in sync across files.
 
-**No log accumulation** — every background process (`openvpn`, the DHCP server) is launched with `>/dev/null 2>&1` and `nohup`; `nohup.out` is not created. The event log lives in `/tmp/travelrouter/` and is trimmed automatically so an all-night session can't fill the disk.
+**No log accumulation** — `openvpn` is spawned with its output sent to `/dev/null`, and the DHCP server is an in-process thread rather than a detached script, so no stray `nohup.out` appears. The event log lives in `/tmp/travelrouter/` and is capped in memory so an all-night session can't fill the disk.
 
 ---
 
@@ -162,15 +210,54 @@ Ordinary internet outages and upstream Wi-Fi drops/roams do *not* require attent
 
 ---
 
+## The ConnMan INPUT firewall
+
+SailfishOS runs ConnMan's firewall with `-P INPUT DROP`. Its only DHCP rule is
+`--sport 67 --dport 68` — the phone acting as a DHCP *client* — and its blanket
+UDP accept only covers `--dports 1024:65535`. Nothing accepts inbound
+`--dport 67`, so a DHCP **server** on this device has every client DISCOVER
+dropped by the INPUT policy before it reaches userspace.
+
+The earlier Scapy implementation never hit this, because `sniff()` reads from an
+`AF_PACKET` socket, which receives frames *before* netfilter's INPUT chain runs.
+A plain UDP socket sits after it. `router.py` therefore installs
+
+```
+iptables -I INPUT 1 -i wlan1 -p udp --dport 67 -j ACCEPT
+```
+
+at stage 2, ahead of the jump to `connman-INPUT` so ConnMan cannot shadow it,
+and the supervisor re-asserts it each cycle because the ConnMan Wi-Fi toggle
+rebuilds those chains. Teardown removes it. If a client associates but reports
+"IP configuration failure", check this rule first.
+
+---
+
+## A note on the default route
+
+`ip route show default` is **not** a reliable indicator that traffic is
+tunnelled on this device. OpenVPN's `redirect-gateway def1` installs
+`0.0.0.0/1` and `128.0.0.0/1` via `tun0`; both are more specific than `default`
+and win for every destination except the VPN server itself, which gets its own
+`/32` via the real gateway to avoid a routing loop. Meanwhile ConnMan re-adds
+its own `default via <gw> dev wlan0` for the managed service whenever it
+reconnects.
+
+So the default route can read `wlan0` while 100% of traffic egresses `tun0`.
+The dashboard asks the kernel (`ip route get`) for the phone's real egress
+interface and for a simulated AP client's, rather than reading the default
+route and drawing the wrong conclusion.
+
+---
+
 ## Requirements
 
 - SailfishOS device with a Wi-Fi chip that supports concurrent station + AP mode on a single radio (tested on Xperia 10 III).
 - Root access on the phone (the script uses `iptables`, `iw`, `ip`, writes to `/proc/sys/...` and `/sys/class/leds/...`).
 - An OpenVPN client profile at `/home/defaultuser/Desktop/mark-home.ovpn`.
-- A Python virtual environment at `/home/defaultuser/python/venv/` with `scapy` installed.
-- `wlan1_dhcp_server.py` at `/home/defaultuser/python/wlan1_dhcp_server.py`.
+- `python3` on the phone (SailfishOS ships it). No virtual environment, no `pip`, no third-party modules.
 
-Paths, SSID/PSK, and timeouts are configurable at the top of `main.sh`.
+Paths, SSID/PSK, and timeouts are configurable at the top of `router.py`.
 
 ---
 
@@ -178,7 +265,7 @@ Paths, SSID/PSK, and timeouts are configurable at the top of `main.sh`.
 
 ```bash
 # as root
-devel-su ./main.sh
+devel-su ./router.py
 ```
 
 The setup steps scroll by, then the live dashboard takes over. Once the **VPN TUNNEL** banner reads `HEALTHY`, your travel router is live — connect any client to SSID `test_ap` (PSK `12345678`) and it will egress through the VPN tunnel.
@@ -188,4 +275,31 @@ From the dashboard:
 - press `r` to force an immediate reconnect,
 - press `q` (or `2`) and confirm to tear everything down and return the phone to normal client-only state.
 
-If you close the dashboard without tearing down (e.g. an SSH drop), the router and its supervisor keep running; re-run the script to reattach.
+Other invocations:
+
+```bash
+devel-su ./router.py --headless   # bring it up with no dashboard
+devel-su ./router.py --status     # one-shot snapshot of a running router
+devel-su ./router.py --down       # tear down and restore normal Wi-Fi
+devel-su ./router.py --stage N    # bring up only as far as stage N
+```
+
+### Staged bring-up
+
+Bring-up is staged so the router can be built incrementally — useful when you
+are working over SSH on the phone's Wi-Fi, since the full stage deliberately
+bounces `wlan0`. Each stage includes the ones below it.
+
+| stage | adds | safe over Wi-Fi SSH |
+|-------|------|---------------------|
+| 1 | pidfile, dashboard, OpenVPN dial, supervisor | yes |
+| 2 | virtual `wlan1` AP, DHCP server, DHCP `INPUT` rule | yes |
+| 3 | leak guard, NAT, `ip_forward`, tunnel routing, ConnMan toggle | **no** |
+
+The two steps that drop the upstream link — `pkill wpa_supplicant` and the
+ConnMan Wi-Fi toggle — are tagged `[SSH-KILLER]` in the setup output. Teardown
+is stage-aware too: `--down` reads the stage the running router recorded and
+undoes exactly that, so tearing down a stage-1 or stage-2 run never touches
+`wlan0`, ConnMan or your iptables rules.
+
+If you close the dashboard without tearing down (e.g. an SSH drop), the router keeps running headless — `SIGHUP` is ignored and the supervisor and DHCP threads carry on. Use `--status` to check on it and `--down` to stop it. Re-running `router.py` while a router is already live will **refuse to start** rather than re-run setup, because setup flushes the `FORWARD` chain and would briefly drop the leak guard while forwarding and NAT were still active.

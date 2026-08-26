@@ -6,7 +6,7 @@ Turn a SailfishOS phone into a discreet Wi-Fi access point whose clients are rou
 
 The phone's Wi-Fi chip is operated in concurrent station + AP mode. `wlan0` connects upstream as a normal client; a virtual `wlan1` interface is created on the same radio and runs in AP mode, broadcasting `test_ap` on the `10.10.0.0/24` subnet.
 
-A small Python DHCP server hands out leases to AP clients. It is standard library only — a UDP socket plus `struct` — so there is no virtual environment and nothing to `pip install`. The socket is pinned to the AP interface with `SO_BINDTODEVICE`, so the server can only ever answer DISCOVERs arriving on `wlan1`; it will never respond on the upstream network you are attached to.
+A small Python DHCP server hands out leases to AP clients. It is standard library only — a UDP socket plus `struct` — so there is no virtual environment and nothing to `pip install`. The socket is pinned to the AP interface with `SO_BINDTODEVICE`, so the server can only ever answer DISCOVERs arriving on `wlan1`; it will never respond on the upstream network you are attached to. It handles DISCOVER, REQUEST, DECLINE, RELEASE and INFORM; leases carry an expiry and are persisted to `/tmp/travelrouter/dhcp_leases.json`, so they survive a restart without handing out duplicates.
 
 ---
 

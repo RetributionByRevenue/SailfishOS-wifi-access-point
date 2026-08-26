@@ -65,6 +65,7 @@ UI_REFRESH        = 1.0               # dashboard refresh / key poll (s)
 
 DNS_SERVERS = ["8.8.8.8", "8.8.4.4"]
 LEASE_TIME  = 86400                   # 24h; T1/T2 are derived from this
+DECLINE_HOLD = 3600                   # keep a declined address out of the pool
 
 # ------------------------------ runtime state --------------------------------
 STATE_DIR   = "/tmp/travelrouter"
@@ -510,7 +511,8 @@ class DHCPServer(threading.Thread):
         self.subnet = ipaddress.ip_network(subnet)
         self.lease_file = lease_file
         self.lease_time = lease_time
-        self.leases = {}                   # mac -> ip
+        self.leases = {}                   # mac -> (ip, expires_epoch)
+        self.declined = {}                 # ip -> hold-until epoch
         self.sock = None
         self._lock = threading.Lock()
         self.load_leases()
@@ -567,22 +569,29 @@ class DHCPServer(threading.Thread):
             self.state.log("dhcp: could not persist leases: %s" % exc)
 
     def prune_expired(self):
-        """Drop leases past their expiry. Caller holds the lock."""
+        """Drop leases past their expiry, and release declined holds. Caller
+        holds the lock."""
         now = time.time()
         dead = [m for m, (_, exp) in self.leases.items() if exp <= now]
         for m in dead:
             ip, _ = self.leases.pop(m)
             self.state.log("dhcp: lease expired %s (%s)" % (ip, m))
+        for ip in [i for i, until in self.declined.items() if until <= now]:
+            del self.declined[ip]
+            self.state.log("dhcp: declined address %s returned to the pool" % ip)
         return dead
 
     def pool(self):
         return [str(ip) for ip in self.subnet.hosts() if str(ip) != self.server_ip]
 
-    def _held_by_others(self, mac):
-        """Addresses held by some *other* client whose lease has not expired."""
+    def _blocked(self, mac):
+        """Addresses we must not hand to `mac`: held by another client on an
+        unexpired lease, or recently declined as already-in-use."""
         now = time.time()
-        return {ip for m, (ip, exp) in self.leases.items()
-                if m != mac and exp > now}
+        blocked = {ip for m, (ip, exp) in self.leases.items()
+                   if m != mac and exp > now}
+        blocked |= {ip for ip, until in self.declined.items() if until > now}
+        return blocked
 
     def lease_for(self, mac):
         with self._lock:
@@ -593,7 +602,7 @@ class DHCPServer(threading.Thread):
                 self.leases[mac] = (ip, now + self.lease_time)
                 self.save_leases()
                 return ip
-            taken = self._held_by_others(mac)
+            taken = self._blocked(mac)
             for ip in self.pool():
                 if ip not in taken:
                     self.leases[mac] = (ip, now + self.lease_time)
@@ -612,7 +621,7 @@ class DHCPServer(threading.Thread):
             return False
         with self._lock:
             self.prune_expired()
-            if str(addr) in self._held_by_others(mac):
+            if str(addr) in self._blocked(mac):
                 return False
             self.leases[mac] = (str(addr), time.time() + self.lease_time)
             self.save_leases()
@@ -740,6 +749,37 @@ class DHCPServer(threading.Thread):
         pkt = self.build_reply(req, ACK, None, lease_opts=False)
         self.send(pkt, dest=ci if ci != "0.0.0.0" else "255.255.255.255")
 
+    def handle_decline(self, req):
+        """The client's ARP probe found the address already in use.
+
+        RFC 2131 4.3.3: the server MUST mark the address unavailable. The
+        address is in the requested_addr option -- ciaddr is zero in a DECLINE.
+        Without this the client loops DISCOVER -> OFFER -> DECLINE forever on
+        the same address, which is very likely what "connects, then stops
+        working" looks like from the outside.
+
+        It is logged loudly because it nearly always means a real conflict:
+        something on the AP subnet with a static address, or a second DHCP
+        server answering on this link.
+        """
+        mac = req["mac"]
+        addr = None
+        if OPT_REQUESTED in req["opts"] and len(req["opts"][OPT_REQUESTED]) == 4:
+            addr = socket.inet_ntoa(req["opts"][OPT_REQUESTED])
+        if addr is None:
+            self.state.log("dhcp: DECLINE from %s carried no address; ignoring" % mac)
+            return
+        with self._lock:
+            self.declined[addr] = time.time() + DECLINE_HOLD
+            entry = self.leases.get(mac)
+            if entry and entry[0] == addr:
+                del self.leases[mac]
+                self.save_leases()
+            self.state.dhcp_leases = len(self.leases)
+        self.state.log("dhcp: DECLINE %s from %s — address already in use; "
+                       "withheld for %ds (check for a static IP or a second "
+                       "DHCP server on %s)" % (addr, mac, DECLINE_HOLD, AP_IFACE))
+
     def process(self, data):
         if len(data) < 240 or data[236:240] != DHCP_MAGIC:
             return
@@ -762,6 +802,8 @@ class DHCPServer(threading.Thread):
             self.handle_discover(req)
         elif mtype == REQUEST:
             self.handle_request(req)
+        elif mtype == DECLINE:
+            self.handle_decline(req)
         elif mtype == INFORM:
             self.handle_inform(req)
         elif mtype == RELEASE:
@@ -1381,6 +1423,11 @@ def cmd_status():
           % (egress_dev() or "none", client_egress_dev() or "none"))
     if st >= 2:
         print("dhcp INPUT rule: %s" % ("present" if dhcp_input_allowed() else "MISSING"))
+        try:
+            with open(LEASE_FILE) as fh:
+                print("dhcp leases: %d on file" % len(json.load(fh)))
+        except (OSError, ValueError):
+            pass
     print("leak guard: %s" % ("active" if leak_guard_on() else "MISSING"))
     return 0
 

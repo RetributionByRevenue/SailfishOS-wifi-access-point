@@ -520,6 +520,10 @@ class DHCPServer(threading.Thread):
     # every start, so restarting it while clients were still associated handed
     # out duplicates. Persisting to disk and deriving the pool from live leases
     # removes that whole class of bug.
+    #
+    # Leases are {mac: (ip, expires_epoch)}. Without an expiry the pool is never
+    # reclaimed: every device that ever associated holds its address forever,
+    # and a /24 eventually runs out with no way back short of deleting the file.
     def load_leases(self):
         try:
             with open(self.lease_file) as fh:
@@ -528,35 +532,71 @@ class DHCPServer(threading.Thread):
             return
         if not isinstance(stored, dict):
             return
+        now = time.time()
         for mac, entry in stored.items():
-            ip = entry[0] if isinstance(entry, (list, tuple)) and entry else entry
+            ip, expires = None, None
+            if isinstance(entry, dict):                   # current format
+                ip, expires = entry.get("ip"), entry.get("expires")
+            elif isinstance(entry, (list, tuple)) and entry:
+                ip = entry[0]                             # legacy (ip, lease_time)
+            elif isinstance(entry, str):
+                ip = entry                                # legacy bare ip
+            if ip is None:
+                continue
             try:
-                if ipaddress.ip_address(str(ip)) in self.subnet:
-                    self.leases[mac] = str(ip)
+                if ipaddress.ip_address(str(ip)) not in self.subnet:
+                    continue
             except (ValueError, TypeError):
                 continue
+            try:
+                expires = float(expires)
+            except (TypeError, ValueError):
+                expires = now + self.lease_time           # legacy: start the clock now
+            if expires > now:
+                self.leases[mac] = (str(ip), expires)
 
     def save_leases(self):
         try:
             os.makedirs(os.path.dirname(self.lease_file), exist_ok=True)
             tmp = self.lease_file + ".tmp"
             with open(tmp, "w") as fh:
-                json.dump(self.leases, fh)
+                json.dump({m: {"ip": ip, "expires": exp}
+                           for m, (ip, exp) in self.leases.items()}, fh)
             os.replace(tmp, self.lease_file)
         except OSError as exc:
             self.state.log("dhcp: could not persist leases: %s" % exc)
 
+    def prune_expired(self):
+        """Drop leases past their expiry. Caller holds the lock."""
+        now = time.time()
+        dead = [m for m, (_, exp) in self.leases.items() if exp <= now]
+        for m in dead:
+            ip, _ = self.leases.pop(m)
+            self.state.log("dhcp: lease expired %s (%s)" % (ip, m))
+        return dead
+
     def pool(self):
         return [str(ip) for ip in self.subnet.hosts() if str(ip) != self.server_ip]
 
+    def _held_by_others(self, mac):
+        """Addresses held by some *other* client whose lease has not expired."""
+        now = time.time()
+        return {ip for m, (ip, exp) in self.leases.items()
+                if m != mac and exp > now}
+
     def lease_for(self, mac):
         with self._lock:
-            if mac in self.leases:
-                return self.leases[mac]
-            taken = set(self.leases.values())
+            self.prune_expired()
+            now = time.time()
+            if mac in self.leases:                        # renew in place
+                ip, _ = self.leases[mac]
+                self.leases[mac] = (ip, now + self.lease_time)
+                self.save_leases()
+                return ip
+            taken = self._held_by_others(mac)
             for ip in self.pool():
                 if ip not in taken:
-                    self.leases[mac] = ip
+                    self.leases[mac] = (ip, now + self.lease_time)
                     self.save_leases()
                     self.state.dhcp_leases = len(self.leases)
                     return ip
@@ -571,13 +611,21 @@ class DHCPServer(threading.Thread):
         if addr not in self.subnet or str(addr) == self.server_ip:
             return False
         with self._lock:
-            for held_mac, held_ip in self.leases.items():
-                if held_ip == str(addr) and held_mac != mac:
-                    return False
-            self.leases[mac] = str(addr)
+            self.prune_expired()
+            if str(addr) in self._held_by_others(mac):
+                return False
+            self.leases[mac] = (str(addr), time.time() + self.lease_time)
             self.save_leases()
             self.state.dhcp_leases = len(self.leases)
         return True
+
+    def lease_ip(self, mac):
+        """Current unexpired address for a client, or None."""
+        with self._lock:
+            entry = self.leases.get(mac)
+            if entry and entry[1] > time.time():
+                return entry[0]
+        return None
 
     def release(self, mac):
         with self._lock:
@@ -586,7 +634,7 @@ class DHCPServer(threading.Thread):
                 self.state.dhcp_leases = len(self.leases)
 
     # ---- wire format --------------------------------------------------------
-    def build_reply(self, req, msg_type, yiaddr):
+    def build_reply(self, req, msg_type, yiaddr, lease_opts=True):
         xid, flags, giaddr, chaddr = req["xid"], req["flags"], req["giaddr"], req["chaddr"]
         yi = socket.inet_aton(yiaddr) if yiaddr else b"\x00" * 4
         pkt = struct.pack(
@@ -604,19 +652,25 @@ class DHCPServer(threading.Thread):
         opts = [(OPT_TYPE, bytes([msg_type])),
                 (OPT_SERVER_ID, socket.inet_aton(self.server_ip))]
         if msg_type in (OFFER, ACK):
+            # Network parameters go in every ACK/OFFER, but RFC 2131 4.3.5 says
+            # a reply to an INFORM MUST NOT carry lease timing -- the client
+            # configured its own address and holds no lease from us.
             opts += [
                 (OPT_SUBNET, socket.inet_aton(str(self.subnet.netmask))),
                 (OPT_ROUTER, socket.inet_aton(self.server_ip)),
-                (OPT_LEASE, struct.pack("!I", self.lease_time)),
-                (OPT_T1, struct.pack("!I", self.lease_time // 2)),
-                (OPT_T2, struct.pack("!I", self.lease_time * 7 // 8)),
                 (OPT_DNS, b"".join(socket.inet_aton(d) for d in DNS_SERVERS)),
             ]
+            if lease_opts:
+                opts += [
+                    (OPT_LEASE, struct.pack("!I", self.lease_time)),
+                    (OPT_T1, struct.pack("!I", self.lease_time // 2)),
+                    (OPT_T2, struct.pack("!I", self.lease_time * 7 // 8)),
+                ]
         return pkt + DHCP_MAGIC + encode_options(opts)
 
-    def send(self, payload):
+    def send(self, payload, dest="255.255.255.255"):
         try:
-            self.sock.sendto(payload, ("255.255.255.255", 68))
+            self.sock.sendto(payload, (dest, 68))
         except OSError as exc:
             self.state.log("dhcp: send failed: %s" % exc)
 
@@ -650,7 +704,7 @@ class DHCPServer(threading.Thread):
             self.state.log("dhcp: REQUEST from %s with no address; ignoring" % mac)
             return
 
-        held = self.leases.get(mac)
+        held = self.lease_ip(mac)
         if held is None:
             # No record: either we restarted, or this is an INIT-REBOOT client
             # confirming an address from a previous session. Honour it when the
@@ -668,6 +722,23 @@ class DHCPServer(threading.Thread):
 
         self.state.log("dhcp: ACK %s -> %s" % (held, mac))
         self.send(self.build_reply(req, ACK, held))
+
+    def handle_inform(self, req):
+        """Client configured its own address and only wants network parameters.
+
+        macOS and Windows both send INFORM in some flows (self-assigned or
+        statically configured addresses, and some wake paths). The old server
+        ignored anything that was not DISCOVER or REQUEST, so those clients got
+        silence and no gateway/DNS -- which looks exactly like a broken network.
+
+        Per RFC 2131 4.3.5: reply with an ACK carrying configuration options but
+        NO lease timing and yiaddr = 0, unicast to the address in ciaddr. No
+        lease is allocated, because we did not give out this address.
+        """
+        ci = req["ciaddr"]
+        self.state.log("dhcp: INFORM from %s (ciaddr %s)" % (req["mac"], ci))
+        pkt = self.build_reply(req, ACK, None, lease_opts=False)
+        self.send(pkt, dest=ci if ci != "0.0.0.0" else "255.255.255.255")
 
     def process(self, data):
         if len(data) < 240 or data[236:240] != DHCP_MAGIC:
@@ -691,6 +762,8 @@ class DHCPServer(threading.Thread):
             self.handle_discover(req)
         elif mtype == REQUEST:
             self.handle_request(req)
+        elif mtype == INFORM:
+            self.handle_inform(req)
         elif mtype == RELEASE:
             self.state.log("dhcp: RELEASE from %s" % req["mac"])
             self.release(req["mac"])
@@ -716,7 +789,14 @@ class DHCPServer(threading.Thread):
         self.state.log("dhcp: listening on %s (%d lease(s) restored)"
                        % (self.iface, len(self.leases)))
 
+        next_prune = time.time() + 60
         while not self.state.stop.is_set():
+            if time.time() >= next_prune:
+                next_prune = time.time() + 60
+                with self._lock:
+                    if self.prune_expired():
+                        self.save_leases()
+                    self.state.dhcp_leases = len(self.leases)
             try:
                 data, _ = self.sock.recvfrom(2048)
             except socket.timeout:

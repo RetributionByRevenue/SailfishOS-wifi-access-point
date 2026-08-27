@@ -98,6 +98,12 @@ has been watched recovering on its own after upstream Wi-Fi dropped.
 
 ---
 
+## License
+
+MIT. See `LICENSE`.
+
+---
+
 ## Architecture
 
 ```mermaid

@@ -62,7 +62,7 @@ OVPN_CONFIG = "/home/defaultuser/Desktop/mark-home.ovpn"
 LED_PATH    = "/sys/class/leds/blue/brightness"
 
 PROBE_HOST        = "8.8.8.8"         # reachability target
-CHECK_INTERVAL    = 2                 # supervisor poll cadence (s)
+CHECK_INTERVAL    = 1                 # supervisor poll cadence (s)
 DIAL_TIMEOUT      = 90                # reconnect: wait for tun0 (s)
 INIT_DIAL_TIMEOUT = 600               # first boot: wait for tun0 (s)
 UI_REFRESH        = 1.0               # dashboard refresh / key poll (s)

@@ -141,6 +141,36 @@ Three further guarantees back it up:
 - **A failed install is fatal.** The install result is verified, not discarded. If the guard cannot be installed, setup aborts and tears down rather than continuing with an open router.
 - **The supervisor re-asserts it** every cycle, and reinstalls if it has gone missing — the guard is never merely *observed*.
 
+### A second layer, outside netfilter
+
+Everything above lives in iptables, so one subsystem misbehaving is enough to
+open it. AP traffic therefore also gets its own routing table, whose fallback
+is a blackhole:
+
+```bash
+ip rule  add iif wlan1 lookup 100 priority 100          # after `local`, before `main`
+ip route replace blackhole default table 100 metric 1000
+ip route replace default dev tun0 table 100 metric 100  # only once tun0 is verified up
+```
+
+Packets arriving on `wlan1` consult table 100 exclusively. With no tunnel the
+lookup hits the blackhole and the packet is discarded **during route lookup,
+before FORWARD is ever consulted** — so a total netfilter failure still cannot
+leak. Verified by flushing FORWARD to `-P ACCEPT` with zero rules and removing
+the tunnel route: `ip route get 8.8.8.8 from 10.10.0.2 iif wlan1` then returns
+`RTNETLINK answers: Invalid argument` rather than a path out `wlan0`.
+
+Two ordering details carry the guarantee:
+
+- **The table is populated before the rule is added.** A rule pointing at an
+  *empty* table does not blackhole — the lookup fails and the kernel falls
+  through to the next rule, i.e. `main`, i.e. out `wlan0`. An empty table is
+  permissive, not restrictive.
+- **The blackhole sits at a worse metric than the tunnel route** rather than
+  being swapped in and out. When `tun0` is deleted the kernel drops its route
+  automatically and the blackhole is simply what remains, so the fail-closed
+  state is reached with no supervisor action and no window in between.
+
 NAT is deliberately `-o tun+` **only**. Masquerading out `wlan0` cannot help a legitimate client packet, since `tun+` is the sole permitted egress; it could only ever turn a leak into a *working* connection instead of a stream of dead packets.
 
 The rules are *stateless* and *always-on*. They don't care what phase the script is in, whether the VPN is up, restarting, dead, or never started. The implications across every realistic failure mode are walked through below.

@@ -52,6 +52,10 @@ AP_MAC    = "12:34:56:78:ab:ce"       # AP L2 identity
 AP_FREQ   = 2412                      # 2412 MHz == channel 1
 AP_SUBNET = "10.10.0.0/24"            # pool the DHCP server hands out from
 NAT_SRC   = "10.10.0.0/16"            # source range to masquerade
+AP_TABLE  = "100"                     # policy-routing table for AP traffic
+AP_RULE_PRIO = "100"                  # after `local` (0), before `main` (32766)
+AP_METRIC_TUN   = "100"               # tunnel default in the AP table
+AP_METRIC_BLACK = "1000"              # blackhole fallback, deliberately worse
 WAN_IFACE = "wlan0"                   # upstream station interface
 
 OVPN_CONFIG = "/home/defaultuser/Desktop/mark-home.ovpn"
@@ -377,9 +381,76 @@ def assert_firewall(stage):
             healthy = install_leak_guard()
             if not healthy:
                 STATE.log("firewall: leak guard REBUILD FAILED")
+        if not (ap_rule_installed() and ap_table_closed()):
+            STATE.log("routing: AP policy route missing — reinstalling")
+            if not install_ap_policy_route():
+                STATE.log("routing: AP policy route REINSTALL FAILED")
+                healthy = False
     if stage >= 2:
         allow_dhcp_input()
     return healthy
+
+
+def ap_rule_installed():
+    rc, out = sh(["ip", "rule", "show"])
+    if rc != 0:
+        return False
+    return any(("iif %s" % AP_IFACE) in line and ("lookup %s" % AP_TABLE) in line
+               for line in out.splitlines())
+
+
+def ap_table_closed():
+    """True if the AP table has its blackhole fallback."""
+    rc, out = sh(["ip", "route", "show", "table", AP_TABLE])
+    return rc == 0 and "blackhole default" in out
+
+
+def install_ap_policy_route():
+    """A second containment layer that does not live in netfilter at all.
+
+    Everything else protecting the AP is an iptables rule, so a single
+    subsystem misbehaving -- chain flushed, policy flipped, ConnMan rebuilding,
+    iptables itself failing -- is enough to open it. This puts a copy of the
+    same guarantee in the routing layer: traffic arriving on wlan1 consults its
+    own table, whose fallback route is a blackhole. With no tunnel the packet
+    is discarded during route lookup, before FORWARD is ever consulted.
+
+    Two ordering details matter:
+
+    * Populate the table BEFORE adding the rule. A rule pointing at an EMPTY
+      table does not blackhole -- the lookup fails and the kernel falls through
+      to the next rule, i.e. `main`, i.e. out wlan0. An empty table is
+      permissive, not restrictive.
+
+    * The blackhole is installed at a deliberately worse metric than the
+      tunnel route rather than being swapped in and out. When tun0 is deleted
+      the kernel removes its route automatically, and the blackhole is simply
+      what remains -- so the fail-closed state is reached with no action from
+      the supervisor and no window in between.
+    """
+    ok(["ip", "route", "replace", "blackhole", "default",
+        "table", AP_TABLE, "metric", AP_METRIC_BLACK])
+    if not ap_rule_installed():
+        ok(["ip", "rule", "add", "iif", AP_IFACE, "lookup", AP_TABLE,
+            "priority", AP_RULE_PRIO])
+    return ap_rule_installed() and ap_table_closed()
+
+
+def ap_route_via_tun():
+    """Point the AP table at the tunnel. Only once tun0 is verified up."""
+    ok(["ip", "route", "replace", "default", "dev", "tun0",
+        "table", AP_TABLE, "metric", AP_METRIC_TUN])
+
+
+def release_ap_policy_route():
+    """Undo install_ap_policy_route(). Rule first, so the table is never left
+    populated-but-unreferenced, then flush."""
+    for _ in range(8):                      # bounded: duplicates are possible
+        if not ap_rule_installed():
+            break
+        if not ok(["ip", "rule", "del", "iif", AP_IFACE, "lookup", AP_TABLE]):
+            break
+    ok(["ip", "route", "flush", "table", AP_TABLE])
 
 
 def install_leak_guard():
@@ -1038,6 +1109,13 @@ class Supervisor(threading.Thread):
             assert_firewall(self.stage)
 
             if not self.reconnect_now.is_set() and vpn_ok():
+                # Keep the AP table pointed at the live tunnel. assert_firewall()
+                # only guarantees the blackhole fallback exists; if the tunnel
+                # route were lost while the tunnel itself stayed healthy,
+                # nothing else would re-add it and clients would sit blackholed
+                # until the next reconnect. `ip route replace` is idempotent.
+                if self.stage >= 3:
+                    ap_route_via_tun()
                 attempts = 0
                 self.state.update(vpn="healthy", wan="up", ssid=ssid,
                                   attempts=0, msg="tunnel healthy")
@@ -1085,6 +1163,7 @@ class Supervisor(threading.Thread):
             if wait_tun(DIAL_TIMEOUT):
                 if self.stage >= 3:
                     route_via_tun()
+                    ap_route_via_tun()     # AP table follows the new tun0
                     install_nat()          # tun0 is new -- (re)assert its NAT rule
                 attempts = 0
                 led(True)
@@ -1159,6 +1238,13 @@ def do_setup(stage=FULL_STAGE, quiet=False):
                   "to continue%s" % (C_RED, C_RESET))
             STATE.log("setup: FATAL, leak guard install failed")
             raise SetupFailed("leak guard install failed")
+
+        step("installing AP policy route (blackhole default, table %s)" % AP_TABLE)
+        if not install_ap_policy_route():
+            print("      %sFATAL: AP policy route could not be installed — "
+                  "refusing to continue%s" % (C_RED, C_RESET))
+            STATE.log("setup: FATAL, AP policy route install failed")
+            raise SetupFailed("AP policy route install failed")
 
         step("clearing stale AP NAT rules from any previous run")
         clear_ap_nat()
@@ -1235,6 +1321,7 @@ def do_setup(stage=FULL_STAGE, quiet=False):
     if wait_tun(INIT_DIAL_TIMEOUT):
         if stage >= 3:
             route_via_tun()
+            ap_route_via_tun()
             print("      %stunnel up — default route now via tun0%s" % (C_GRN, C_RESET))
             STATE.log("setup: tunnel up, default route via tun0")
         else:
@@ -1315,8 +1402,9 @@ def do_teardown(stage=FULL_STAGE):
     ok(["ip", "link", "delete", "tun0"])
 
     if stage >= 3:
-        item("removing AP NAT + releasing leak guard")
+        item("removing AP NAT + policy route + releasing leak guard")
         clear_ap_nat()
+        release_ap_policy_route()
         release_leak_guard()
 
     if stage >= 2:
@@ -1435,6 +1523,17 @@ def render(snap):
         out.append(row("good", "Leak guard", "active · non-tun forwards DROP"))
     else:
         out.append(row("bad", "Leak guard", "MISSING — clients could leak!"))
+
+    # Second, independent layer: routing, not netfilter.
+    if stage < 3:
+        out.append(row("na", "AP route table", "not installed at stage %d" % stage))
+    elif ap_rule_installed() and ap_table_closed():
+        out.append(row("good", "AP route table",
+                       "table %s · blackhole fallback" % AP_TABLE))
+    elif ap_rule_installed():
+        out.append(row("bad", "AP route table", "table %s has NO blackhole" % AP_TABLE))
+    else:
+        out.append(row("bad", "AP route table", "policy rule MISSING"))
 
     # Report where packets actually go, not what the `default` route says --
     # see egress_dev() for why those differ on this device.
@@ -1623,6 +1722,9 @@ def cmd_status():
         print("dhcp server: not started at stage %d" % st)
     if st >= 3:
         print("leak guard: %s" % ("active" if leak_guard_on() else "MISSING"))
+        print("ap policy route: rule %s, blackhole %s"
+              % ("present" if ap_rule_installed() else "MISSING",
+                 "present" if ap_table_closed() else "MISSING"))
     else:
         print("leak guard: not installed at stage %d" % st)
     return 0

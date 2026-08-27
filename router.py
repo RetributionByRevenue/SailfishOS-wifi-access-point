@@ -43,7 +43,7 @@ from collections import deque
 from datetime import datetime
 
 # ----------------------------- configuration ---------------------------------
-AP_SSID   = "test_ap"                 # broadcast network name
+AP_SSID   = "mark_router"             # broadcast network name
 AP_PSK    = "12345678"                # AP pre-shared key (WPA2)
 AP_IFACE  = "wlan1"                   # virtual AP interface
 AP_ADDR   = "10.10.0.1"               # AP gateway address
@@ -377,6 +377,40 @@ def forward_chain():
     if rc != 0:
         return None
     return [" ".join(line.split()) for line in out.splitlines() if line.strip()]
+
+
+_AP_MAC_CACHE = [""]
+
+
+def ap_mac_actual():
+    """wlan1's real MAC. Cached -- it does not change, and the dashboard would
+    otherwise fork `ip link` once a second just to filter one line."""
+    if not _AP_MAC_CACHE[0]:
+        rc, out = sh(["ip", "link", "show", AP_IFACE])
+        m = re.search(r"link/ether (\S+)", out)
+        if rc == 0 and m:
+            _AP_MAC_CACHE[0] = m.group(1).lower()
+    return _AP_MAC_CACHE[0]
+
+
+def ap_clients():
+    """MACs currently associated with the AP.
+
+    `iw station dump` rather than the lease file: a lease outlives the
+    association by up to LEASE_TIME, so counting leases would report devices
+    that walked out of range hours ago. This driver also lists the interface's
+    own MAC as a station, so that is filtered out.
+    """
+    rc, out = sh(["iw", "dev", AP_IFACE, "station", "dump"])
+    if rc != 0:
+        return []
+    own = ap_mac_actual()
+    macs = []
+    for line in out.splitlines():
+        m = re.match(r"Station\s+(\S+)", line.strip())
+        if m and m.group(1).lower() != own:
+            macs.append(m.group(1).lower())
+    return macs
 
 
 def leak_guard_on():
@@ -1593,7 +1627,9 @@ def render(snap):
     if stage < 2:
         out.append(row("na", "Access Point", "not built at stage %d" % stage))
     elif ap_on_air():
-        out.append(row("good", "Access Point", "%s on %s · %s" % (AP_SSID, AP_IFACE, AP_ADDR)))
+        n = len(ap_clients())
+        out.append(row("good", "Access Point", "%s on %s · %s · %d client%s"
+                       % (AP_SSID, AP_IFACE, AP_ADDR, n, "" if n == 1 else "s")))
     elif iface_up(AP_IFACE):
         out.append(row("bad", "Access Point", "%s up but NOT broadcasting" % AP_IFACE))
     else:
@@ -1781,7 +1817,24 @@ def read_stage(default=FULL_STAGE):
         return default
 
 
+def _pipe_friendly():
+    """Behave like a normal Unix tool when piped into `head` or `grep -q`.
+
+    Python turns SIGPIPE into BrokenPipeError, so `--status | head -3` printed
+    a traceback instead of exiting quietly. Restoring the default disposition
+    is done ONLY for the short read-only commands: the long-running router must
+    keep Python-level handling, because there a dead stdout has to raise (and
+    be caught as TerminalGone) rather than kill the process and orphan a
+    beaconing AP.
+    """
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
 def cmd_status():
+    _pipe_friendly()
     pid = running_pid()
     if not pid:
         print("router not running")
@@ -1796,8 +1849,14 @@ def cmd_status():
     # Stage-gate every label: at stages 1-2 these subsystems are correctly
     # absent, and reporting them as MISSING reads like a fault.
     if st >= 2:
-        print("access point: %s" % ("on air (%s)" % AP_SSID if ap_on_air()
-                                    else "NOT broadcasting"))
+        if ap_on_air():
+            clients = ap_clients()
+            print("access point: on air (%s), %d client(s) associated"
+                  % (AP_SSID, len(clients)))
+            for mac in clients:
+                print("    %s" % mac)
+        else:
+            print("access point: NOT broadcasting")
     else:
         print("access point: not built at stage %d" % st)
     print("egress path: phone -> %s, client -> %s"
@@ -1881,6 +1940,7 @@ def main(argv):
         pass
 
     if "--help" in args or "-h" in args:
+        _pipe_friendly()
         print("SailfishOS Travel Router — single file, stdlib only\n")
         print("  ./router.py             bring up + dashboard")
         print("  ./router.py --headless  bring up, no dashboard")

@@ -21,7 +21,7 @@ devel-su ./router.py
 ```
 
 Setup steps scroll by, then a live dashboard. When **VPN TUNNEL** says `HEALTHY`,
-join SSID `test_ap` (PSK `12345678` — change it) and you are through the tunnel.
+join SSID `mark_router` (PSK `12345678` — change it) and you are through the tunnel.
 
 `r` reconnect · `q` tear down and quit · `Ctrl-C` close dashboard, router keeps running
 
@@ -46,7 +46,7 @@ Build it in pieces. Handy over SSH, because the full stage bounces `wlan0`.
 | 2 | `wlan1` AP, DHCP, **leak guard, policy route, IPv6 off** | yes |
 | 3 | `ip_forward`, NAT, tunnel routing, ConnMan | **no** |
 
-Containment ships with the AP, not with forwarding. The moment `test_ap` is on
+Containment ships with the AP, not with forwarding. The moment `mark_router` is on
 air it is already contained.
 
 Steps that drop your link are tagged `[SSH-KILLER]`. `--down` undoes only the
@@ -93,7 +93,7 @@ SSID, PSK, paths and timeouts are constants at the top of `router.py`.
 ## Real world
 
 VPN server on an Ubuntu laptop in **Canada**. Phone in **Malaysia**. A client on
-`test_ap` measured **~23 Mbps down / ~44 Mbps up** through the tunnel. Auto-reconnect
+`mark_router` measured **~23 Mbps down / ~44 Mbps up** through the tunnel. Auto-reconnect
 has been watched recovering on its own after upstream Wi-Fi dropped.
 
 ---
@@ -114,7 +114,7 @@ flowchart TB
 
     subgraph phone["SailfishOS phone · Malaysia"]
         direction TB
-        WLAN1["wlan1 — AP<br/>SSID test_ap<br/>gateway 10.10.0.1/24"]
+        WLAN1["wlan1 — AP<br/>SSID mark_router<br/>gateway 10.10.0.1/24"]
         DHCP["DHCP server thread<br/>stdlib socket, bound to wlan1"]
         LG{"iptables FORWARD<br/>leak guard<br/>from wlan1, not out tun+ = DROP"}
         TUN0["tun0 — OpenVPN client"]

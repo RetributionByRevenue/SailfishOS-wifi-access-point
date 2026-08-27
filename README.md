@@ -122,15 +122,28 @@ Despite the Malaysia → Canada round trip (~half the globe), an AP client measu
 
 ## Anti-leak design (how it doesn't leak)
 
-The script installs one iptables rule — the **leak guard** — and never removes it during normal operation:
+The AP is **default-denied by the chain policy**, not merely by a rule:
 
 ```bash
-iptables -A FORWARD -i wlan1 ! -o tun+ -j DROP
+iptables -P FORWARD DROP
+iptables -A FORWARD -i wlan1 -o tun+  -j ACCEPT   # the only path out
+iptables -A FORWARD -i wlan1 ! -o tun+ -j DROP    # explicit, belt and braces
+iptables -A FORWARD ! -i wlan1        -j ACCEPT   # don't break other forwarding
 ```
 
-Read literally: **any packet entering from `wlan1` whose outgoing interface is not a `tun*` device gets dropped, period.**
+Read literally: **a packet entering from `wlan1` leaves only via a `tun*` device, and if this chain is ever emptied the policy still drops it.**
 
-This rule is *stateless* and *always-on*. It doesn't care what phase the script is in, whether the VPN is up, restarting, dead, or never started. The implications across every realistic failure mode are walked through below.
+That last part is the point. A single DROP rule in a chain whose policy is `ACCEPT` is only as good as the rule's continued existence — flush the chain and the AP is wide open. Policy `DROP` inverts the failure mode: an empty chain is *closed*. This matters because the chain genuinely does get flushed, by us at setup and by ConnMan rebuilding its own chains during reconnects and roams.
+
+Three further guarantees back it up:
+
+- **Ordering.** The guard is the first thing stage 3 installs — before `ip_forward` is enabled and before `wpa_supplicant` puts the SSID on air. There is no instant at which the AP is beaconing with forwarding enabled and no guard. Teardown mirrors it: `ip_forward=0` is the *first* action, before any rule or interface is removed.
+- **A failed install is fatal.** The install result is verified, not discarded. If the guard cannot be installed, setup aborts and tears down rather than continuing with an open router.
+- **The supervisor re-asserts it** every cycle, and reinstalls if it has gone missing — the guard is never merely *observed*.
+
+NAT is deliberately `-o tun+` **only**. Masquerading out `wlan0` cannot help a legitimate client packet, since `tun+` is the sole permitted egress; it could only ever turn a leak into a *working* connection instead of a stream of dead packets.
+
+The rules are *stateless* and *always-on*. They don't care what phase the script is in, whether the VPN is up, restarting, dead, or never started. The implications across every realistic failure mode are walked through below.
 
 **Scenario A — Script just started, no `tun0` yet (setup window)**
 

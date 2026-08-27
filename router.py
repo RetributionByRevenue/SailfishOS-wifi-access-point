@@ -235,11 +235,36 @@ def ap_on_air():
     return rc == 0 and re.search(r"^\s*ssid\s+\S", out, re.M) is not None
 
 
+_IPT_W = None
+
+
+def ipt(*args):
+    """iptables argv, with -w when supported.
+
+    Without -w, a call that loses the xtables lock fails outright. render()
+    polls iptables twice a second while the supervisor and install_nat() also
+    call it, so contention is routine -- and because ok() swallows failures, a
+    lost lock during the leak-guard install would silently leave the router
+    open. -w makes the call wait instead of fail.
+    """
+    global _IPT_W
+    if _IPT_W is None:
+        _IPT_W = ["-w"] if sh(["iptables", "-w", "-S", "FORWARD"],
+                              capture=False)[0] == 0 else []
+    return ["iptables"] + _IPT_W + list(args)
+
+
+# FORWARD rules, in install order. The AP is default-denied by the chain POLICY,
+# not merely by a rule, so a flushed chain is closed rather than open.
+AP_ALLOW_RULE  = ["-i", AP_IFACE, "-o", "tun+", "-j", "ACCEPT"]
+LEAK_GUARD_RULE = ["-i", AP_IFACE, "!", "-o", "tun+", "-j", "DROP"]
+OTHER_FWD_RULE = ["!", "-i", AP_IFACE, "-j", "ACCEPT"]
+
 DHCP_IN_RULE = ["-i", AP_IFACE, "-p", "udp", "--dport", "67", "-j", "ACCEPT"]
 
 
 def dhcp_input_allowed():
-    return ok(["iptables", "-C", "INPUT"] + DHCP_IN_RULE)
+    return ok(ipt("-C", "INPUT", *DHCP_IN_RULE))
 
 
 def allow_dhcp_input():
@@ -259,16 +284,50 @@ def allow_dhcp_input():
     because the ConnMan Wi-Fi toggle at stage 3 rebuilds those rules.
     """
     if not dhcp_input_allowed():
-        ok(["iptables", "-I", "INPUT", "1"] + DHCP_IN_RULE)
+        ok(ipt("-I", "INPUT", "1", *DHCP_IN_RULE))
     return dhcp_input_allowed()
 
 
 def deny_dhcp_input():
-    ok(["iptables", "-D", "INPUT"] + DHCP_IN_RULE)
+    ok(ipt("-D", "INPUT", *DHCP_IN_RULE))
 
 
 def leak_guard_on():
-    return ok(["iptables", "-C", "FORWARD", "-i", AP_IFACE, "!", "-o", "tun+", "-j", "DROP"])
+    """True only if AP traffic cannot forward anywhere except tun+.
+
+    Checks the chain POLICY as well as the DROP rule. The rule alone is not the
+    guarantee: with policy ACCEPT, an empty FORWARD chain forwards everything.
+    """
+    rc, out = sh(ipt("-S", "FORWARD"))
+    if rc != 0 or "-P FORWARD DROP" not in out:
+        return False
+    return ok(ipt("-C", "FORWARD", *LEAK_GUARD_RULE))
+
+
+def install_leak_guard():
+    """Make the AP fail closed, and keep it closed even if this chain is flushed.
+
+    Policy DROP is the load-bearing part. Previously the guard was a single DROP
+    rule in a chain whose policy was ACCEPT, so any flush -- ours at setup,
+    ConnMan rebuilding its chains, or a crash between flush and re-add -- left
+    FORWARD empty and *open* while wlan1 was already beaconing and ip_forward
+    was already 1. With policy DROP an empty chain is closed.
+
+    OTHER_FWD_RULE keeps the phone's unrelated forwarding (USB/Bluetooth
+    tethering) working. It is added last on purpose: if it is ever lost, the
+    failure is restrictive rather than permissive.
+    """
+    ok(ipt("-F", "FORWARD"))
+    ok(ipt("-P", "FORWARD", "DROP"))
+    for rule in (AP_ALLOW_RULE, LEAK_GUARD_RULE, OTHER_FWD_RULE):
+        ok(ipt("-A", "FORWARD", *rule))
+    return leak_guard_on()
+
+
+def release_leak_guard():
+    """Undo install_leak_guard(). Only for teardown."""
+    ok(ipt("-F", "FORWARD"))
+    ok(ipt("-P", "FORWARD", "ACCEPT"))
 
 
 def vpn_ok():
@@ -359,40 +418,45 @@ def route_via_tun():
     ok(["ip", "route", "add", "default", "dev", "tun0"])
 
 
-def nat_ifaces():
-    """Interfaces worth masquerading out of, as the shell version enumerated."""
-    skip = {"lo", "rmnet_ipa0", "rndis0", AP_IFACE}
-    rc, out = sh(["ip", "-o", "link", "show"])
-    names = []
+def clear_ap_nat():
+    """Remove MASQUERADE rules for the AP subnet left behind by a previous run.
+
+    Setup never used to do this -- only teardown did -- so after any exit that
+    skipped teardown (Ctrl-C, crash, SIGKILL) the old rules were still loaded.
+    Combined with an open FORWARD chain that turned a leak into a *working*
+    NATed connection out wlan0 rather than a stream of dead packets.
+
+    Only our own rules are removed; flushing POSTROUTING wholesale would also
+    destroy ConnMan's tethering NAT.
+    """
+    rc, out = sh(ipt("-t", "nat", "-S", "POSTROUTING"))
+    if rc != 0:
+        return
     for line in out.splitlines():
-        m = re.match(r"\d+:\s+([^:@]+)", line)
-        if m:
-            name = m.group(1).strip()
-            if name not in skip:
-                names.append(name)
-    return names
+        if line.startswith("-A POSTROUTING") and NAT_SRC in line:
+            ok(ipt("-t", "nat", "-D", *line.split()[1:]))
 
 
 def install_nat(verbose=False):
-    """Install MASQUERADE for the AP subnet. Safe to re-run: every rule is added
-    only after a -C check fails, so repeat calls are no-ops.
+    """MASQUERADE the AP subnet out tun+ only. Safe to re-run.
 
-    The tun+ wildcard matters. Enumerating interfaces can only see devices that
-    exist at that moment, so when the first dial times out (tun0 not yet
-    created) the tunnel would otherwise never get a NAT rule -- clients would
-    forward into it with un-NATed 10.10.0.x sources indefinitely. The wildcard
-    covers any tun device the VPN brings up later, whenever it appears.
+    Deliberately *only* tun+. This used to enumerate every interface and
+    masquerade out all of them, wlan0 included. For a leak-guarded router that
+    is worse than useless: the only egress clients are ever permitted is tun+,
+    so a wlan0 rule can never help a legitimate packet -- it can only turn a
+    leak into a working connection. It also left ~13 stale rules behind and
+    fired 14 iptables calls on every reconnect.
+
+    The wildcard (rather than tun0) matters because when the first dial times
+    out there is no tun device yet to enumerate; tun+ covers whatever the VPN
+    brings up later, whenever it appears.
     """
-    targets = ["tun+"] + nat_ifaces()
-    for iface in targets:
-        check = ["iptables", "-t", "nat", "-C", "POSTROUTING",
-                 "-s", NAT_SRC, "-o", iface, "-j", "MASQUERADE"]
-        if not ok(check):
-            add = list(check)
-            add[3] = "-A"
-            ok(add)
-        if verbose:
-            print("      %smasquerade via %s%s" % (C_DIM, iface, C_RESET))
+    if not ok(ipt("-t", "nat", "-C", "POSTROUTING",
+                  "-s", NAT_SRC, "-o", "tun+", "-j", "MASQUERADE")):
+        ok(ipt("-t", "nat", "-A", "POSTROUTING",
+               "-s", NAT_SRC, "-o", "tun+", "-j", "MASQUERADE"))
+    if verbose:
+        print("      %smasquerade via tun+ only%s" % (C_DIM, C_RESET))
 
 
 def vpn_dial():
@@ -880,8 +944,16 @@ class Supervisor(threading.Thread):
         while not self.state.stop.is_set():
             ssid = ssid_now()
 
-            # ConnMan rebuilds its firewall chains when Wi-Fi is toggled, so
-            # re-assert the DHCP INPUT rule rather than assuming it survived.
+            # ConnMan rebuilds its firewall chains when Wi-Fi is toggled --
+            # which it does on its own during reconnects and roams, precisely
+            # when this loop is busy recovering. Re-assert both rules rather
+            # than assuming they survived. The guard was previously installed
+            # once and thereafter only *observed* by the dashboard, so if it
+            # vanished mid-session nothing put it back.
+            if self.stage >= 3 and not leak_guard_on():
+                self.state.log("supervisor: leak guard MISSING — reinstalling")
+                if not install_leak_guard():
+                    self.state.log("supervisor: leak guard REINSTALL FAILED")
             if self.stage >= 2:
                 allow_dhcp_input()
 
@@ -957,6 +1029,10 @@ AP_WPA_CONF = "/tmp/wpa_supplicant_ap.conf"
 AP_CTRL_SOCK = "/var/run/wpa_supplicant/" + AP_IFACE
 
 
+class SetupFailed(Exception):
+    """Setup hit a condition that must not be continued past."""
+
+
 def do_setup(stage=FULL_STAGE, quiet=False):
     """Bring the router up to `stage`. See STAGE_DESC.
 
@@ -986,9 +1062,22 @@ def do_setup(stage=FULL_STAGE, quiet=False):
             )
 
     if stage >= 3:
-        step("sanitising FORWARD chain (clean baseline)")
-        ok(["iptables", "-F", "FORWARD"])
-        ok(["iptables", "-P", "FORWARD", "ACCEPT"])
+        # FIRST, before ip_forward is enabled and before the AP is on air.
+        # Previously this flushed FORWARD here and only re-added the guard nine
+        # steps later, after the blocking ConnMan toggle -- leaving a window of
+        # seconds where wlan1 was beaconing, ip_forward was 1, and FORWARD was
+        # empty with policy ACCEPT. Clients hold the saved PSK and a persisted
+        # lease, so they reassociate and transmit immediately; that window was
+        # exactly when they were most likely to be sending.
+        step("installing leak guard (FORWARD policy DROP; %s ↛ non-tun)" % AP_IFACE)
+        if not install_leak_guard():
+            print("      %sFATAL: leak guard could not be installed — refusing "
+                  "to continue%s" % (C_RED, C_RESET))
+            STATE.log("setup: FATAL, leak guard install failed")
+            raise SetupFailed("leak guard install failed")
+
+        step("clearing stale AP NAT rules from any previous run")
+        clear_ap_nat()
 
         step("killing existing wpa_supplicant instances  [SSH-KILLER]")
         ok(["pkill", "wpa_supplicant"])
@@ -1050,10 +1139,6 @@ def do_setup(stage=FULL_STAGE, quiet=False):
                 "--dest=net.connman", "/net/connman/technology/wifi",
                 "net.connman.Technology.SetProperty", "string:Powered",
                 "variant:boolean:" + val])
-
-        step("installing permanent leak guard (%s ↛ non-tun DROP)" % AP_IFACE)
-        ok(["iptables", "-D", "FORWARD", "-i", AP_IFACE, "!", "-o", "tun+", "-j", "DROP"])
-        ok(["iptables", "-A", "FORWARD", "-i", AP_IFACE, "!", "-o", "tun+", "-j", "DROP"])
 
     step("waiting for upstream Wi-Fi + capturing gateway")
     for _ in range(20):
@@ -1123,6 +1208,17 @@ def do_teardown(stage=FULL_STAGE):
     def item(msg):
         print("  %s▸%s %s" % (C_CYN, C_RESET, msg))
 
+    if stage >= 3:
+        # FIRST. Everything below removes rules or interfaces; with forwarding
+        # still enabled, the gap between flushing FORWARD and deleting wlan1
+        # is another open window. Killing forwarding up front closes it.
+        item("disabling IPv4 forwarding (first, so nothing can transit)")
+        try:
+            with open("/proc/sys/net/ipv4/ip_forward", "w") as fh:
+                fh.write("0")
+        except OSError:
+            pass
+
     item("stopping worker threads")
     STATE.stop.set()
 
@@ -1135,10 +1231,9 @@ def do_teardown(stage=FULL_STAGE):
     ok(["ip", "link", "delete", "tun0"])
 
     if stage >= 3:
-        item("flushing iptables (NAT + FORWARD)")
-        ok(["iptables", "-t", "nat", "-F", "POSTROUTING"])
-        ok(["iptables", "-F", "FORWARD"])
-        ok(["iptables", "-P", "FORWARD", "ACCEPT"])
+        item("removing AP NAT + releasing leak guard")
+        clear_ap_nat()
+        release_leak_guard()
 
     if stage >= 2:
         item("removing DHCP INPUT rule")
@@ -1156,13 +1251,6 @@ def do_teardown(stage=FULL_STAGE):
             pass
 
     if stage >= 3:
-        item("disabling IPv4 forwarding")
-        try:
-            with open("/proc/sys/net/ipv4/ip_forward", "w") as fh:
-                fh.write("0")
-        except OSError:
-            pass
-
         item("restarting %s as a normal client" % WAN_IFACE)
         ok(["pkill", "wpa_supplicant"])
         ok(["ip", "link", "set", WAN_IFACE, "down"])
@@ -1565,7 +1653,19 @@ def main(argv):
     if headless:
         print("Stage %d: %s" % (stage, STAGE_DESC[stage]))
         print("First VPN dial may take up to %ds." % INIT_DIAL_TIMEOUT)
-    do_setup(stage, quiet=headless)
+    try:
+        do_setup(stage, quiet=headless)
+    except SetupFailed as exc:
+        # Never leave a half-built router running: the AP may already be on air
+        # with forwarding enabled. Undo whatever got built and exit non-zero.
+        print("Setup aborted: %s" % exc, file=sys.stderr)
+        STATE.log("setup aborted: %s" % exc)
+        do_teardown(stage)
+        try:
+            os.unlink(PID_FILE)
+        except OSError:
+            pass
+        return 1
 
     dhcp = None
     if stage >= 2:

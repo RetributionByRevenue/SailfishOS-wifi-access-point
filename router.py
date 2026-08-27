@@ -66,6 +66,7 @@ CHECK_INTERVAL    = 4                 # supervisor poll cadence (s)
 DIAL_TIMEOUT      = 90                # reconnect: wait for tun0 (s)
 INIT_DIAL_TIMEOUT = 600               # first boot: wait for tun0 (s)
 UI_REFRESH        = 1.0               # dashboard refresh / key poll (s)
+MAX_CLIENT_ROWS   = 8                 # dashboard client rows before eliding
 
 DNS_SERVERS = ["8.8.8.8", "8.8.4.4"]
 LEASE_TIME  = 86400                   # 24h; T1/T2 are derived from this
@@ -1643,9 +1644,8 @@ def render(snap):
     if stage < 2:
         out.append(row("na", "Access Point", "not built at stage %d" % stage))
     elif ap_on_air():
-        n = len(ap_clients())
-        out.append(row("good", "Access Point", "%s on %s · %s · %d client%s"
-                       % (AP_SSID, AP_IFACE, AP_ADDR, n, "" if n == 1 else "s")))
+        out.append(row("good", "Access Point", "%s on %s · %s"
+                       % (AP_SSID, AP_IFACE, AP_ADDR)))
     elif iface_up(AP_IFACE):
         out.append(row("bad", "Access Point", "%s up but NOT broadcasting" % AP_IFACE))
     else:
@@ -1705,6 +1705,21 @@ def render(snap):
         out.append(row("good", "DHCP server", "leasing on %s · %d lease(s)"
                        % (AP_IFACE, snap["dhcp_leases"])))
     out.append(hr())
+
+    out.append(CLR_EOL)
+    out.append("  %sConnected clients%s%s" % (C_BOLD, C_RESET, CLR_EOL))
+    if stage < 2:
+        out.append("    %snot serving clients at stage %d%s%s"
+                   % (C_DIM, stage, C_RESET, CLR_EOL))
+    else:
+        clients = ap_clients()
+        if not clients:
+            out.append("    %snone%s%s" % (C_DIM, C_RESET, CLR_EOL))
+        for ip, mac in clients[:MAX_CLIENT_ROWS]:
+            out.append("    %-15s %s%s%s%s" % (ip, C_DIM, mac, C_RESET, CLR_EOL))
+        extra = len(clients) - MAX_CLIENT_ROWS
+        if extra > 0:
+            out.append("    %s… and %d more%s%s" % (C_DIM, extra, C_RESET, CLR_EOL))
 
     out.append(CLR_EOL)
     out.append("  %sRecent events%s%s" % (C_BOLD, C_RESET, CLR_EOL))

@@ -1472,6 +1472,14 @@ class RawTerminal:
         return ch
 
 
+def _say(msg):
+    """print() that tolerates a terminal that has already gone away."""
+    try:
+        print(msg)
+    except OSError:
+        pass
+
+
 class TerminalGone(Exception):
     """stdin died -- the SSH session dropped or the terminal closed."""
 
@@ -1486,6 +1494,12 @@ def confirm_teardown(term):
 
 
 def tui_loop(supervisor):
+    """Run the dashboard. Returns why it stopped:
+
+        "teardown" -- user pressed q and confirmed
+        "detach"   -- user pressed Ctrl-C; dashboard closes, router stays up
+        "stopped"  -- STATE.stop was set from outside (SIGTERM from --down)
+    """
     with RawTerminal() as term:
         while not STATE.stop.is_set():
             render(STATE.snapshot())
@@ -1497,10 +1511,10 @@ def tui_loop(supervisor):
                 kill_tunnel()
             elif ch in ("q", "Q", "2"):
                 if confirm_teardown(term):
-                    return True
-            elif ch == "\x03":              # Ctrl-C in raw mode
-                return False
-    return False
+                    return "teardown"
+            elif ch == "\x03":              # raw mode: Ctrl-C is a byte, not a signal
+                return "detach"
+    return "stopped"
 
 
 # =============================================================================
@@ -1725,6 +1739,7 @@ def main(argv):
     supervisor = Supervisor(STATE, stage)
     supervisor.start()
 
+    outcome = "stopped"
     if headless:
         STATE.log("running headless; use --down to tear down")
         print("Router up at stage %d. `%s --down` to stop." % (stage, argv[0]))
@@ -1732,31 +1747,63 @@ def main(argv):
             while not STATE.stop.is_set():
                 STATE.stop.wait(1)
         except KeyboardInterrupt:
-            pass
+            # Ctrl-C in headless mode is a deliberate stop at the foreground
+            # process, and there is no dashboard to detach from -- so tear
+            # down rather than leave the AP up with no supervisor.
+            _say("\ntearing down…")
+            outcome = "teardown"
     else:
         try:
-            stopping["teardown"] = tui_loop(supervisor)
+            outcome = tui_loop(supervisor)
         except TerminalGone:
-            # Terminal vanished (SSH dropped). Keep routing; the AP and tunnel
-            # stay up and the supervisor keeps healing until --down.
+            # Terminal vanished (SSH dropped). Keep routing.
             STATE.log("terminal lost — continuing headless")
-            try:
-                while not STATE.stop.is_set():
-                    STATE.stop.wait(1)
-            except KeyboardInterrupt:
-                pass
+            outcome = "detach"
         except KeyboardInterrupt:
-            stopping["teardown"] = False
+            outcome = "detach"
 
-    if stopping["teardown"]:
+    if stopping["signalled"]:
+        outcome = "stopped"
+
+    if outcome == "teardown":
         do_teardown(stage)
         STATE.log("session ended")
-    elif stopping["signalled"]:
+    elif outcome == "stopped":
+        # --down in another shell signalled us; that process runs the teardown.
         STATE.stop.set()
         STATE.log("session ended (stopped externally)")
     else:
-        STATE.stop.set()
-        print("\nUI closed — router still running. `%s --down` to tear down." % argv[0])
+        # DETACH. The supervisor and DHCP server are threads in THIS process,
+        # not detached daemons as they were in the shell version. Setting
+        # STATE.stop and returning here -- which is what Ctrl-C used to do --
+        # killed both threads and exited, leaving the AP beaconing, tun0 up,
+        # leak guard and NAT installed and ip_forward=1, with nothing healing
+        # any of it: the next upstream drop would block every client forever,
+        # new clients would get no lease, the health LED would be frozen on,
+        # and --status would report "router not running" while the SSID was
+        # still on air. The message printed there ("router still running") was
+        # inherited from the shell version, where the supervisor really was a
+        # separate process; here it was simply false.
+        #
+        # So detaching means staying alive headless -- exactly what the
+        # SSH-drop path already did.
+        STATE.log("dashboard detached — continuing headless")
+        _say("")
+        _say("Dashboard closed. Router is STILL RUNNING at stage %d." % stage)
+        _say("This process must stay alive: the supervisor and DHCP server are")
+        _say("threads inside it, so killing it stops them healing.")
+        _say("  Ctrl-C again          tear down and restore normal Wi-Fi")
+        _say("  %s --down   (from another shell)" % argv[0])
+        try:
+            while not STATE.stop.is_set():
+                STATE.stop.wait(1)
+        except KeyboardInterrupt:
+            _say("\ntearing down…")
+            do_teardown(stage)
+            STATE.log("session ended")
+        else:
+            STATE.stop.set()
+            STATE.log("session ended (stopped externally)")
 
     try:
         os.unlink(PID_FILE)

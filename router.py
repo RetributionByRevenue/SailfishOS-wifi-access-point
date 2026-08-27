@@ -85,8 +85,8 @@ STAGE_FILE  = os.path.join(STATE_DIR, "stage")
 # every step that would drop the connection you are typing on.
 STAGE_DESC = {
     1: "dashboard + OpenVPN + supervisor (no AP, no iptables) — safe over SSH",
-    2: "stage 1 + virtual wlan1 AP + DHCP server + INPUT rule — safe over SSH",
-    3: "full router: leak guard, NAT, tunnel routing, ConnMan — WILL drop SSH",
+    2: "stage 1 + wlan1 AP, DHCP, leak guard, policy route — safe over SSH",
+    3: "full router: ip_forward, NAT, tunnel routing, ConnMan — WILL drop SSH",
 }
 FULL_STAGE = 3
 
@@ -274,6 +274,65 @@ OTHER_FWD_RULE = ["!", "-i", AP_IFACE, "-j", "ACCEPT"]
 
 DHCP_IN_RULE = ["-i", AP_IFACE, "-p", "udp", "--dport", "67", "-j", "ACCEPT"]
 
+# IPv6. Bringing wlan1 up makes the kernel assign a link-local address and
+# clients do the same, so IPv6 exists on the AP link whether we want it or not.
+# A *leak* additionally needs net.ipv6.conf.all.forwarding=1 (defaults off) and
+# a router advertisement for clients to get a route -- and nothing here runs
+# radvd. So the stock state is already safe.
+#
+# It is nonetheless worth closing, because the entire guard above is iptables,
+# i.e. IPv4 only, while ip6tables FORWARD policy is ACCEPT. If IPv6 forwarding
+# were ever enabled by something else -- tethering does exactly that -- there
+# would be no guard on that path at all. Cheaper to have no IPv6 on wlan1.
+IPV6_DISABLE = "/proc/sys/net/ipv6/conf/%s/disable_ipv6"
+V6_GUARD_RULE = ["-i", AP_IFACE, "-j", "DROP"]
+
+
+def ipv6_disabled(iface=AP_IFACE):
+    path = IPV6_DISABLE % iface
+    if not os.path.exists(path):
+        return True                      # no IPv6 stack for this interface
+    try:
+        with open(path) as fh:
+            return fh.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def disable_ipv6(iface=AP_IFACE):
+    """Set before `ip link set up`, so a link-local is never assigned at all."""
+    try:
+        with open(IPV6_DISABLE % iface, "w") as fh:
+            fh.write("1")
+    except OSError:
+        pass
+    return ipv6_disabled(iface)
+
+
+def ip6t(*args):
+    ipt()                                # ensure the wait flag is probed
+    return ["ip6tables"] + (_IPT_W or []) + list(args)
+
+
+def v6_guard_on():
+    return ok(ip6t("-C", "FORWARD", *V6_GUARD_RULE))
+
+
+def install_v6_guard():
+    """Second copy of the IPv6 containment, in ip6tables.
+
+    disable_ipv6 on the interface is the primary fix; this survives the
+    interface being recreated with the knob reset. Inserted rather than made a
+    policy, so the phone's own IPv6 forwarding is left alone.
+    """
+    if not v6_guard_on():
+        ok(ip6t("-I", "FORWARD", "1", *V6_GUARD_RULE))
+    return v6_guard_on()
+
+
+def remove_v6_guard():
+    ok(ip6t("-D", "FORWARD", *V6_GUARD_RULE))
+
 
 def dhcp_input_allowed():
     return ok(ipt("-C", "INPUT", *DHCP_IN_RULE))
@@ -355,7 +414,7 @@ def assert_firewall(stage):
     as it was most likely to be disturbed.
     """
     healthy = True
-    if stage >= 3:
+    if stage >= 2:
         got, want = forward_chain(), expected_forward()
         if got != want:
             _FW["rebuilds"] += 1
@@ -388,6 +447,8 @@ def assert_firewall(stage):
                 healthy = False
     if stage >= 2:
         allow_dhcp_input()
+        if not v6_guard_on():
+            install_v6_guard()
     return healthy
 
 
@@ -1224,7 +1285,15 @@ def do_setup(stage=FULL_STAGE, quiet=False):
                 "}\n" % (AP_SSID, AP_FREQ, AP_PSK)
             )
 
-    if stage >= 3:
+    if stage >= 2:
+        # Containment belongs with the AP, not with forwarding. Stage 2 used to
+        # put test_ap on air and hand out leases with no guard at all, on the
+        # assumption that ip_forward was 0 -- an assumption never verified, and
+        # false whenever USB/Bluetooth tethering has enabled forwarding, or
+        # after a stage-3 run died before teardown (only a clean teardown resets
+        # it). Neither the FORWARD rules nor the wlan1 policy route can drop an
+        # SSH session, so there is no reason to defer them.
+        #
         # FIRST, before ip_forward is enabled and before the AP is on air.
         # Previously this flushed FORWARD here and only re-added the guard nine
         # steps later, after the blocking ConnMan toggle -- leaving a window of
@@ -1249,6 +1318,10 @@ def do_setup(stage=FULL_STAGE, quiet=False):
         step("clearing stale AP NAT rules from any previous run")
         clear_ap_nat()
 
+        step("blocking IPv6 forwarding from %s" % AP_IFACE)
+        install_v6_guard()
+
+    if stage >= 3:
         step("killing existing wpa_supplicant instances  [SSH-KILLER]")
         ok(["pkill", "wpa_supplicant"])
         time.sleep(1)
@@ -1257,6 +1330,14 @@ def do_setup(stage=FULL_STAGE, quiet=False):
         step("creating virtual %s (AP) on top of %s" % (AP_IFACE, WAN_IFACE))
         ok(["iw", "dev", WAN_IFACE, "interface", "add", AP_IFACE,
             "type", "__ap", "addr", AP_MAC])
+
+        # Before the link comes up, so no link-local address is ever assigned.
+        step("disabling IPv6 on %s" % AP_IFACE)
+        if not disable_ipv6(AP_IFACE):
+            print("      %sWARNING: could not disable IPv6 on %s%s"
+                  % (C_YEL, AP_IFACE, C_RESET))
+            STATE.log("setup: could not disable IPv6 on %s" % AP_IFACE)
+
         ok(["ip", "addr", "add", "%s/%d" % (AP_ADDR, AP_CIDR), "dev", AP_IFACE])
         ok(["ip", "link", "set", AP_IFACE, "up"])
 
@@ -1401,11 +1482,12 @@ def do_teardown(stage=FULL_STAGE):
     ok(["ip", "route", "flush", "dev", "tun0"])
     ok(["ip", "link", "delete", "tun0"])
 
-    if stage >= 3:
+    if stage >= 2:
         item("removing AP NAT + policy route + releasing leak guard")
         clear_ap_nat()
         release_ap_policy_route()
         release_leak_guard()
+        remove_v6_guard()
 
     if stage >= 2:
         item("removing DHCP INPUT rule")
@@ -1440,7 +1522,7 @@ def do_teardown(stage=FULL_STAGE):
                 "net.connman.Technology.SetProperty", "string:Powered",
                 "variant:boolean:" + val])
     else:
-        item("leaving %s, iptables and ConnMan untouched (stage %d)"
+        item("leaving %s, ConnMan and IPv4 forwarding untouched (stage %d)"
              % (WAN_IFACE, stage))
 
     item("turning off VPN-health LED")
@@ -1517,7 +1599,7 @@ def render(snap):
     else:
         out.append(row("bad", "Access Point", "%s down" % AP_IFACE))
 
-    if stage < 3:
+    if stage < 2:
         out.append(row("na", "Leak guard", "not installed at stage %d" % stage))
     elif leak_guard_on():
         out.append(row("good", "Leak guard", "active · non-tun forwards DROP"))
@@ -1525,7 +1607,7 @@ def render(snap):
         out.append(row("bad", "Leak guard", "MISSING — clients could leak!"))
 
     # Second, independent layer: routing, not netfilter.
-    if stage < 3:
+    if stage < 2:
         out.append(row("na", "AP route table", "not installed at stage %d" % stage))
     elif ap_rule_installed() and ap_table_closed():
         out.append(row("good", "AP route table",
@@ -1551,6 +1633,15 @@ def render(snap):
         out.append(row("bad", "Egress path", "no route"))
     else:
         out.append(row("bad", "Egress path", "via %s — NOT tunnelled" % dev))
+
+    if stage < 2:
+        out.append(row("na", "IPv6 on AP", "n/a at stage %d" % stage))
+    elif ipv6_disabled() and v6_guard_on():
+        out.append(row("good", "IPv6 on AP", "disabled on %s · v6 forward DROP" % AP_IFACE))
+    elif ipv6_disabled():
+        out.append(row("warn", "IPv6 on AP", "disabled, but v6 FORWARD rule missing"))
+    else:
+        out.append(row("bad", "IPv6 on AP", "NOT disabled on %s" % AP_IFACE))
 
     if stage < 2:
         out.append(row("na", "DHCP server", "not started at stage %d" % stage))
@@ -1720,11 +1811,14 @@ def cmd_status():
             pass
     else:
         print("dhcp server: not started at stage %d" % st)
-    if st >= 3:
+    if st >= 2:
         print("leak guard: %s" % ("active" if leak_guard_on() else "MISSING"))
         print("ap policy route: rule %s, blackhole %s"
               % ("present" if ap_rule_installed() else "MISSING",
                  "present" if ap_table_closed() else "MISSING"))
+        print("ipv6 on %s: %s (v6 forward rule %s)"
+              % (AP_IFACE, "disabled" if ipv6_disabled() else "ENABLED",
+                 "present" if v6_guard_on() else "MISSING"))
     else:
         print("leak guard: not installed at stage %d" % st)
     return 0

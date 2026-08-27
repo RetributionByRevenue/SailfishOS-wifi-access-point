@@ -43,8 +43,11 @@ Build it in pieces. Handy over SSH, because the full stage bounces `wlan0`.
 | stage | adds | safe over Wi-Fi SSH |
 |-------|------|---------------------|
 | 1 | dashboard, OpenVPN, supervisor | yes |
-| 2 | `wlan1` AP, DHCP server | yes |
-| 3 | leak guard, NAT, routing, ConnMan | **no** |
+| 2 | `wlan1` AP, DHCP, **leak guard, policy route, IPv6 off** | yes |
+| 3 | `ip_forward`, NAT, tunnel routing, ConnMan | **no** |
+
+Containment ships with the AP, not with forwarding. The moment `test_ap` is on
+air it is already contained.
 
 Steps that drop your link are tagged `[SSH-KILLER]`. `--down` undoes only the
 stage that was built.
@@ -66,6 +69,11 @@ consulted. So netfilter failing completely is still not enough to leak.
 
 NAT is `-o tun+` only. Masquerading out `wlan0` could only ever turn a leak into
 a *working* leak.
+
+**IPv6** is switched off on `wlan1` before the link comes up, so it never gets a
+link-local address, plus an `ip6tables` DROP in case the knob is ever reset. The
+IPv4 guard is IPv4-only, and `ip6tables` policy is ACCEPT, so this is the one
+path it could not otherwise cover.
 
 Read `install_leak_guard()` and `install_ap_policy_route()`. Code is law.
 

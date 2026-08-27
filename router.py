@@ -394,23 +394,39 @@ def ap_mac_actual():
 
 
 def ap_clients():
-    """MACs currently associated with the AP.
+    """Devices currently on the AP, as a sorted list of (ip, mac).
 
-    `iw station dump` rather than the lease file: a lease outlives the
-    association by up to LEASE_TIME, so counting leases would report devices
-    that walked out of range hours ago. This driver also lists the interface's
-    own MAC as a station, so that is filtered out.
+    Not the lease file: a lease outlives the association by up to LEASE_TIME,
+    so it reports devices that left hours ago -- and misses statically
+    configured clients entirely, since they never ask for one.
+
+    Not `iw station dump` either, despite that being the textbook source. On
+    this chipset it reports only the interface's own MAC and never lists an
+    associated client, verified with a real client sitting on the AP. It is
+    still consulted, so the count is right on drivers where it does work, but
+    the neighbour table is what actually finds anything here: any device the
+    phone has exchanged traffic with on wlan1, static or DHCP. Entries the
+    kernel has given up on are excluded.
     """
-    rc, out = sh(["iw", "dev", AP_IFACE, "station", "dump"])
-    if rc != 0:
-        return []
+    seen = {}
+    rc, out = sh(["ip", "neigh", "show", "dev", AP_IFACE])
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[1] == "lladdr":
+                state = parts[-1].upper()
+                if state not in ("FAILED", "INCOMPLETE"):
+                    seen[parts[2].lower()] = parts[0]
+
     own = ap_mac_actual()
-    macs = []
-    for line in out.splitlines():
-        m = re.match(r"Station\s+(\S+)", line.strip())
-        if m and m.group(1).lower() != own:
-            macs.append(m.group(1).lower())
-    return macs
+    rc, out = sh(["iw", "dev", AP_IFACE, "station", "dump"])
+    if rc == 0:
+        for line in out.splitlines():
+            m = re.match(r"Station\s+(\S+)", line.strip())
+            if m and m.group(1).lower() != own:
+                seen.setdefault(m.group(1).lower(), "?")
+
+    return sorted(((ip, mac) for mac, ip in seen.items()))
 
 
 def leak_guard_on():
@@ -1853,8 +1869,8 @@ def cmd_status():
             clients = ap_clients()
             print("access point: on air (%s), %d client(s) associated"
                   % (AP_SSID, len(clients)))
-            for mac in clients:
-                print("    %s" % mac)
+            for ip, mac in clients:
+                print("    %-15s %s" % (ip, mac))
         else:
             print("access point: NOT broadcasting")
     else:

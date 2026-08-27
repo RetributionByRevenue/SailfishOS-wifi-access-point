@@ -308,6 +308,14 @@ def expected_forward():
             "-A FORWARD " + " ".join(OTHER_FWD_RULE)]
 
 
+def forward_chain():
+    """FORWARD as `iptables -S` renders it, whitespace-normalised. None on error."""
+    rc, out = sh(ipt("-S", "FORWARD"))
+    if rc != 0:
+        return None
+    return [" ".join(line.split()) for line in out.splitlines() if line.strip()]
+
+
 def leak_guard_on():
     """True only if FORWARD is EXACTLY the canonical chain.
 
@@ -327,11 +335,10 @@ def leak_guard_on():
     OTHER_FWD_RULE, so the cost of that strictness is low and the alternative
     is a guard that can be silently bypassed.
     """
-    rc, out = sh(ipt("-S", "FORWARD"))
-    if rc != 0:
-        return False
-    got = [" ".join(line.split()) for line in out.splitlines() if line.strip()]
-    return got == expected_forward()
+    return forward_chain() == expected_forward()
+
+
+_FW = {"last_log": 0.0, "last_sig": None, "rebuilds": 0}
 
 
 def assert_firewall(stage):
@@ -344,11 +351,32 @@ def assert_firewall(stage):
     as it was most likely to be disturbed.
     """
     healthy = True
-    if stage >= 3 and not leak_guard_on():
-        STATE.log("firewall: FORWARD chain deviated from canonical — rebuilding")
-        healthy = install_leak_guard()
-        if not healthy:
-            STATE.log("firewall: leak guard REBUILD FAILED")
+    if stage >= 3:
+        got, want = forward_chain(), expected_forward()
+        if got != want:
+            _FW["rebuilds"] += 1
+            sig, now = repr(got), time.time()
+            # Log the ACTUAL chain beside the expected one. This check depends on
+            # `iptables -S` round-tripping our rules byte-identically; if a build
+            # rendered them differently, leak_guard_on() would be False forever
+            # and this would rebuild every cycle for the whole session. That
+            # fails closed, so it is not a leak -- but it would be a silent
+            # iptables treadmill surfacing as battery drain rather than an error.
+            # Printing both makes a formatting mismatch instantly
+            # distinguishable from genuine tampering.
+            #
+            # Rate-limited: a persistent fight with ConnMan re-adding a rule
+            # would otherwise bury the log in identical lines. The signal is
+            # "this keeps happening" -- the rebuild counter -- not each event.
+            if sig != _FW["last_sig"] or now - _FW["last_log"] > 60:
+                STATE.log("firewall: FORWARD deviated (rebuild #%d)"
+                          % _FW["rebuilds"])
+                STATE.log("firewall:   got  %s" % got)
+                STATE.log("firewall:   want %s" % want)
+                _FW["last_log"], _FW["last_sig"] = now, sig
+            healthy = install_leak_guard()
+            if not healthy:
+                STATE.log("firewall: leak guard REBUILD FAILED")
     if stage >= 2:
         allow_dhcp_input()
     return healthy
@@ -367,8 +395,15 @@ def install_leak_guard():
     tethering) working. It is added last on purpose: if it is ever lost, the
     failure is restrictive rather than permissive.
     """
-    ok(ipt("-F", "FORWARD"))
+    # Policy FIRST, then flush. Order matters because assert_firewall() calls
+    # this mid-session, and the case that triggers a rebuild is a chain that has
+    # already deviated -- possibly with the policy flipped to ACCEPT. Flushing
+    # first would then empty the chain while it was still ACCEPT, with
+    # ip_forward=1 and clients associated: a brief window in which the whole
+    # design inverts. Closing the door before emptying the room means no
+    # reachable state has an open chain.
     ok(ipt("-P", "FORWARD", "DROP"))
+    ok(ipt("-F", "FORWARD"))
     for rule in (AP_ALLOW_RULE, LEAK_GUARD_RULE, OTHER_FWD_RULE):
         ok(ipt("-A", "FORWARD", *rule))
     return leak_guard_on()
@@ -1568,8 +1603,13 @@ def cmd_status():
     except OSError:
         print("(no status published yet)")
     st = read_stage()
-    print("access point: %s" % ("on air (%s)" % AP_SSID if ap_on_air()
-                                else "NOT broadcasting"))
+    # Stage-gate every label: at stages 1-2 these subsystems are correctly
+    # absent, and reporting them as MISSING reads like a fault.
+    if st >= 2:
+        print("access point: %s" % ("on air (%s)" % AP_SSID if ap_on_air()
+                                    else "NOT broadcasting"))
+    else:
+        print("access point: not built at stage %d" % st)
     print("egress path: phone -> %s, client -> %s"
           % (egress_dev() or "none", client_egress_dev() or "none"))
     if st >= 2:
@@ -1579,7 +1619,12 @@ def cmd_status():
                 print("dhcp leases: %d on file" % len(json.load(fh)))
         except (OSError, ValueError):
             pass
-    print("leak guard: %s" % ("active" if leak_guard_on() else "MISSING"))
+    else:
+        print("dhcp server: not started at stage %d" % st)
+    if st >= 3:
+        print("leak guard: %s" % ("active" if leak_guard_on() else "MISSING"))
+    else:
+        print("leak guard: not installed at stage %d" % st)
     return 0
 
 
@@ -1704,7 +1749,7 @@ def main(argv):
         pass
     STATE.log("session started")
 
-    stopping = {"teardown": False, "signalled": False}
+    stopping = {"signalled": False}
 
     def on_term(signum, frame):
         # `--down` from another shell signals us, then runs teardown itself.

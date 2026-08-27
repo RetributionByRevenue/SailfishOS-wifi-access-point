@@ -1,5 +1,8 @@
 # SailfishOS Wi-Fi Access Point + VPN Travel Router
 
+A travel router that is just your phone. No second box, no power brick, no
+ethernet dongle, no cables. One device you already carry and already charge.
+
 <img src=https://raw.githubusercontent.com/RetributionByRevenue/SailfishOS-wifi-access-point/refs/heads/main/wifi.PNG>
 
 Phone makes Wi-Fi. Clients join it. All their traffic goes out an OpenVPN tunnel.

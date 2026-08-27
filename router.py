@@ -249,8 +249,16 @@ def ipt(*args):
     """
     global _IPT_W
     if _IPT_W is None:
-        _IPT_W = ["-w"] if sh(["iptables", "-w", "-S", "FORWARD"],
-                              capture=False)[0] == 0 else []
+        # Bare -w waits for the xtables lock FOREVER. render() calls iptables
+        # from the UI thread twice a second, so a stuck lock would hang the
+        # dashboard outright rather than show one stale row. Prefer a bounded
+        # wait, fall back to unbounded, then to no locking at all.
+        for flag in (["-w", "5"], ["-w"], []):
+            if sh(["iptables"] + flag + ["-S", "FORWARD"], capture=False)[0] == 0:
+                _IPT_W = flag
+                break
+        else:
+            _IPT_W = []
     return ["iptables"] + _IPT_W + list(args)
 
 
@@ -292,16 +300,58 @@ def deny_dhcp_input():
     ok(ipt("-D", "INPUT", *DHCP_IN_RULE))
 
 
-def leak_guard_on():
-    """True only if AP traffic cannot forward anywhere except tun+.
+def expected_forward():
+    """The canonical FORWARD chain, exactly as `iptables -S` renders it."""
+    return ["-P FORWARD DROP",
+            "-A FORWARD " + " ".join(AP_ALLOW_RULE),
+            "-A FORWARD " + " ".join(LEAK_GUARD_RULE),
+            "-A FORWARD " + " ".join(OTHER_FWD_RULE)]
 
-    Checks the chain POLICY as well as the DROP rule. The rule alone is not the
-    guarantee: with policy ACCEPT, an empty FORWARD chain forwards everything.
+
+def leak_guard_on():
+    """True only if FORWARD is EXACTLY the canonical chain.
+
+    Spot-checking the policy plus `-C` on the DROP rule is not sufficient.
+    `-C` answers "does this rule exist", not "is it reachable", and iptables
+    evaluates in order: an ACCEPT inserted at the HEAD of the chain would let
+    wlan1 out via wlan0 while the spot check still returned True, leaving the
+    dashboard green and the supervisor idle. Head insertion is not
+    hypothetical -- it is exactly what ConnMan does to chains it manages, and
+    the reason our own DHCP rule uses `-I INPUT 1`.
+
+    Comparing the whole chain costs one iptables call and catches insertion,
+    reordering, policy change and deletion in one test.
+
+    This is deliberately strict: any third-party FORWARD rule counts as a
+    deviation and triggers a rebuild. Unrelated forwarding still works via
+    OTHER_FWD_RULE, so the cost of that strictness is low and the alternative
+    is a guard that can be silently bypassed.
     """
     rc, out = sh(ipt("-S", "FORWARD"))
-    if rc != 0 or "-P FORWARD DROP" not in out:
+    if rc != 0:
         return False
-    return ok(ipt("-C", "FORWARD", *LEAK_GUARD_RULE))
+    got = [" ".join(line.split()) for line in out.splitlines() if line.strip()]
+    return got == expected_forward()
+
+
+def assert_firewall(stage):
+    """Re-assert every firewall invariant. Cheap, idempotent, call often.
+
+    Hoisted out of the supervisor's outer loop because recovery can sit in the
+    inner "wait for Wi-Fi" loop for the whole duration of an outage or roam --
+    which is precisely when ConnMan is rebuilding chains. Checking only at the
+    top of the outer loop meant the guard went unverified for exactly as long
+    as it was most likely to be disturbed.
+    """
+    healthy = True
+    if stage >= 3 and not leak_guard_on():
+        STATE.log("firewall: FORWARD chain deviated from canonical — rebuilding")
+        healthy = install_leak_guard()
+        if not healthy:
+            STATE.log("firewall: leak guard REBUILD FAILED")
+    if stage >= 2:
+        allow_dhcp_input()
+    return healthy
 
 
 def install_leak_guard():
@@ -950,12 +1000,7 @@ class Supervisor(threading.Thread):
             # than assuming they survived. The guard was previously installed
             # once and thereafter only *observed* by the dashboard, so if it
             # vanished mid-session nothing put it back.
-            if self.stage >= 3 and not leak_guard_on():
-                self.state.log("supervisor: leak guard MISSING — reinstalling")
-                if not install_leak_guard():
-                    self.state.log("supervisor: leak guard REINSTALL FAILED")
-            if self.stage >= 2:
-                allow_dhcp_input()
+            assert_firewall(self.stage)
 
             if not self.reconnect_now.is_set() and vpn_ok():
                 attempts = 0
@@ -982,6 +1027,10 @@ class Supervisor(threading.Thread):
             # wait until upstream Wi-Fi is genuinely back before redialing
             self.state.update(msg="waiting for Wi-Fi (%s)" % WAN_IFACE)
             while not self.state.stop.is_set():
+                # An outage can last arbitrarily long and ConnMan churns its
+                # chains throughout it, so re-assert here too rather than only
+                # at the top of the outer loop.
+                assert_firewall(self.stage)
                 ensure_wlan0_route()
                 if upstream_ok():
                     break

@@ -62,7 +62,20 @@ OVPN_CONFIG = "/home/defaultuser/Desktop/mark-home.ovpn"
 LED_PATH    = "/sys/class/leds/blue/brightness"
 
 PROBE_HOST        = "8.8.8.8"         # reachability target
+# One probe target is a single point of failure. If it goes dark, starts
+# filtering ICMP or rate-limits us, every probe fails forever and the
+# supervisor redials in a loop against a perfectly healthy tunnel. Fall back
+# through alternates before concluding anything is wrong.
+PROBE_HOSTS       = ["8.8.8.8", "1.1.1.1", "9.9.9.9"]
 CHECK_INTERVAL    = 1                 # supervisor poll cadence (s)
+# OpenVPN's own ping-restart -- pushed by the server, 120s here -- is the
+# authority on whether the link is dead. Tearing the tunnel down after a single
+# lost packet fights that: on a flaky uplink a momentary blip became a full
+# redial costing ~11s of downtime, 415 times in one 112h session, while the
+# upstream tested reachable again 1-2s later in 96% of cases. Require a run of
+# consecutive failures, so transient loss is ridden out while a genuine outage
+# is still caught in FAIL_THRESHOLD * CHECK_INTERVAL seconds.
+FAIL_THRESHOLD    = 5
 DIAL_TIMEOUT      = 90                # reconnect: wait for tun0 (s)
 INIT_DIAL_TIMEOUT = 600               # first boot: wait for tun0 (s)
 UI_REFRESH        = 1.0               # dashboard refresh / key poll (s)
@@ -80,6 +93,7 @@ GW_FILE     = os.path.join(STATE_DIR, "wlan0_gw")
 LEASE_FILE  = os.path.join(STATE_DIR, "dhcp_leases.json")
 PID_FILE    = os.path.join(STATE_DIR, "router.pid")
 STAGE_FILE  = os.path.join(STATE_DIR, "stage")
+OVPN_LOG    = os.path.join(STATE_DIR, "openvpn.log")
 
 # Bring-up is staged so the router can be built incrementally over SSH. Each
 # stage is a superset of the one below it. Stages 1 and 2 deliberately avoid
@@ -229,6 +243,16 @@ def iface_up(name):
 
 def tun_up():
     return ok(["ip", "link", "show", "tun0", "up"])
+
+
+def tun_exists():
+    """Present at all, UP or not.
+
+    Teardown has to care about mere existence, not readiness: a DOWN tun0 still
+    owns whatever routes were installed through it, and the redirect-gateway
+    halves are enough to black-hole the phone on their own.
+    """
+    return ok(["ip", "link", "show", "tun0"])
 
 
 def ap_on_air():
@@ -598,15 +622,31 @@ def release_leak_guard():
     ok(ipt("-P", "FORWARD", "ACCEPT"))
 
 
+def _reaches_any(iface):
+    """True if any probe host answers a single ping bound to `iface`.
+
+    Stops at the first success, so the common case still costs exactly one
+    ping; the alternates only cost anything when the first target is already
+    failing, which is precisely when a second opinion is worth having.
+    """
+    for host in PROBE_HOSTS:
+        if ok(["ping", "-I", iface, "-c1", "-W2", host], timeout=6):
+            return True
+    return False
+
+
 def vpn_ok():
-    """Healthy only if tun0 is up AND actually passes traffic through itself."""
-    return tun_up() and ok(["ping", "-I", "tun0", "-c1", "-W2", PROBE_HOST], timeout=6)
+    """Healthy only if tun0 is up AND actually passes traffic through itself.
+
+    A single failure here is NOT grounds for a redial -- see FAIL_THRESHOLD in
+    the supervisor. This stays a one-shot probe because wait_tun() needs it to
+    report the first moment a fresh tunnel starts passing traffic.
+    """
+    return tun_up() and _reaches_any("tun0")
 
 
 def upstream_ok():
-    return iface_up(WAN_IFACE) and ok(
-        ["ping", "-c1", "-W2", "-I", WAN_IFACE, PROBE_HOST], timeout=6
-    )
+    return iface_up(WAN_IFACE) and _reaches_any(WAN_IFACE)
 
 
 def default_route_dev():
@@ -727,11 +767,29 @@ def install_nat(verbose=False):
         print("      %smasquerade via tun+ only%s" % (C_DIM, C_RESET))
 
 
+# Set for the duration of teardown. do_teardown() kills openvpn and deletes
+# tun0, but the supervisor is a live thread that may already be past its
+# stop check and about to dial: a process spawned in that window outlives the
+# teardown, keeping tun0 and its redirect-gateway halves (0.0.0.0/1 and
+# 128.0.0.0/1) installed. Those two routes beat the default route, so the
+# phone loses ALL connectivity except its own LAN until someone deletes tun0
+# by hand. Refusing to dial once teardown has begun closes that window.
+_TEARING_DOWN = threading.Event()
+
+
 def vpn_dial():
+    if _TEARING_DOWN.is_set():
+        STATE.log("dial suppressed — teardown in progress")
+        return
     STATE.log("dialing OpenVPN (%s)" % OVPN_CONFIG)
     try:
+        # Previously stdout/stderr went to DEVNULL, so when the tunnel misbehaved
+        # there was nothing to look at: no cipher negotiation, no PUSH_REPLY, no
+        # reason for a disconnect. Keep a real log instead -- it costs nothing
+        # and is the difference between diagnosing an outage and guessing.
         subprocess.Popen(
-            ["openvpn", "--dev", "tun", "--config", OVPN_CONFIG],
+            ["openvpn", "--dev", "tun", "--config", OVPN_CONFIG,
+             "--log-append", OVPN_LOG],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -766,6 +824,26 @@ def kill_openvpn(timeout=8):
 
 def kill_tunnel():
     kill_openvpn()
+    ok(["ip", "route", "flush", "dev", "tun0"])
+    ok(["ip", "link", "delete", "tun0"])
+
+
+def clear_stale_tunnel():
+    """Remove a tun0 left behind by a previous run that died without teardown.
+
+    Such a tun0 still owns the redirect-gateway halves (0.0.0.0/1 and
+    128.0.0.0/1). Being more specific than `default`, they win for every
+    destination, so with no openvpn behind them the phone can reach its own
+    LAN and nothing else -- which looks exactly like "the internet keeps
+    dropping" and survives reboots of the router script but not of the phone.
+    Only fires when no openvpn is running, so it can never disturb a live
+    tunnel belonging to someone else.
+    """
+    if not tun_exists():
+        return
+    if sh(["pgrep", "openvpn"], capture=False)[0] == 0:
+        return
+    STATE.log("startup: removing stale tun0 from a previous session")
     ok(["ip", "route", "flush", "dev", "tun0"])
     ok(["ip", "link", "delete", "tun0"])
 
@@ -1208,6 +1286,7 @@ class Supervisor(threading.Thread):
 
     def run(self):
         attempts = 0
+        fails = 0
         led(True)
         while not self.state.stop.is_set():
             ssid = ssid_now()
@@ -1229,6 +1308,7 @@ class Supervisor(threading.Thread):
                 if self.stage >= 3:
                     ap_route_via_tun()
                 attempts = 0
+                fails = 0
                 self.state.update(vpn="healthy", wan="up", ssid=ssid,
                                   attempts=0, msg="tunnel healthy")
                 led(True)
@@ -1238,6 +1318,22 @@ class Supervisor(threading.Thread):
             if self.reconnect_now.is_set():
                 self.reconnect_now.clear()
                 self.state.log("manual reconnect requested")
+                fails = 0
+            else:
+                # Probe failed -- but one lost packet is not an outage. Ride out
+                # short blips rather than converting each into a ~11s redial;
+                # OpenVPN's own ping-restart is still there as the backstop for
+                # anything longer than this window.
+                fails += 1
+                if fails < FAIL_THRESHOLD:
+                    self.state.update(vpn="degraded", ssid=ssid,
+                                      msg="probe failed (%d/%d) — watching"
+                                          % (fails, FAIL_THRESHOLD))
+                    self.state.stop.wait(CHECK_INTERVAL)
+                    continue
+                self.state.log("supervisor: %d consecutive probe failures"
+                               % fails)
+            fails = 0
 
             # ---- tunnel is NOT passing traffic -> recover --------------------
             led(False)
@@ -1523,15 +1619,29 @@ def do_teardown(stage=FULL_STAGE):
             pass
 
     item("stopping worker threads")
+    _TEARING_DOWN.set()          # no thread may dial from here on
     STATE.stop.set()
 
-    item("killing openvpn")
-    if not kill_openvpn():
-        print("      %swarning: openvpn still running%s" % (C_YEL, C_RESET))
-
-    item("cleaning up tun0 (routes + device)")
-    ok(["ip", "route", "flush", "dev", "tun0"])
-    ok(["ip", "link", "delete", "tun0"])
+    # Verify rather than assume. A single kill-then-delete is a race against a
+    # supervisor thread that may be dialling right now, and losing it strands
+    # the phone with tun0 owning 0.0.0.0/1 + 128.0.0.0/1 and no openvpn behind
+    # them -- every packet except LAN-local black-holed, with nothing left
+    # running to heal it. Re-check, and say so plainly if it could not be done.
+    item("killing openvpn + cleaning up tun0 (routes + device)")
+    for _ in range(3):
+        kill_openvpn()
+        ok(["ip", "route", "flush", "dev", "tun0"])
+        ok(["ip", "link", "delete", "tun0"])
+        alive = sh(["pgrep", "openvpn"], capture=False)[0] == 0
+        if not alive and not tun_exists():
+            break
+        time.sleep(1)
+    else:
+        print("      %sWARNING: openvpn or tun0 survived teardown.%s"
+              % (C_RED, C_RESET))
+        print("      %sRun: pkill openvpn; ip link delete tun0%s"
+              % (C_YEL, C_RESET))
+        STATE.log("teardown: FAILED to remove openvpn/tun0")
 
     if stage >= 2:
         item("removing AP NAT + policy route + releasing leak guard")
@@ -2028,6 +2138,8 @@ def main(argv):
 
     # An SSH drop must not take the router down with it.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    clear_stale_tunnel()
 
     write_pid(stage)
     try:

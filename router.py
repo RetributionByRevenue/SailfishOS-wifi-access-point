@@ -829,19 +829,26 @@ def kill_tunnel():
 
 
 def clear_stale_tunnel():
-    """Remove a tun0 left behind by a previous run that died without teardown.
+    """Fresh start: kill every openvpn and remove any tun0 before dialing.
 
-    Such a tun0 still owns the redirect-gateway halves (0.0.0.0/1 and
+    A previous run that died without teardown leaves its openvpn behind, still
+    retrying in the background. Those orphans were previously left alone, so
+    each crashed run added another: two or more clients dialing the same
+    config, fighting over tun0 and writing the same log, while ours waited out
+    INIT_DIAL_TIMEOUT behind them. main() has already confirmed no router is
+    running, so any openvpn alive now is an orphan -- kill them all.
+
+    A stale tun0 still owns the redirect-gateway halves (0.0.0.0/1 and
     128.0.0.0/1). Being more specific than `default`, they win for every
     destination, so with no openvpn behind them the phone can reach its own
     LAN and nothing else -- which looks exactly like "the internet keeps
     dropping" and survives reboots of the router script but not of the phone.
-    Only fires when no openvpn is running, so it can never disturb a live
-    tunnel belonging to someone else.
     """
-    if not tun_exists():
-        return
     if sh(["pgrep", "openvpn"], capture=False)[0] == 0:
+        STATE.log("startup: killing leftover openvpn instance(s) for a fresh start")
+        if not kill_openvpn():
+            STATE.log("startup: WARNING, openvpn survived SIGKILL")
+    if not tun_exists():
         return
     STATE.log("startup: removing stale tun0 from a previous session")
     ok(["ip", "route", "flush", "dev", "tun0"])
@@ -1387,7 +1394,7 @@ class Supervisor(threading.Thread):
 # =============================================================================
 #  SETUP / TEARDOWN
 # =============================================================================
-STEP = [0]
+STEP = [-1]                      # first step() prints [00]
 
 
 def step(msg):
@@ -1404,7 +1411,68 @@ class SetupFailed(Exception):
     """Setup hit a condition that must not be continued past."""
 
 
-def do_setup(stage=FULL_STAGE, quiet=False):
+def _is_router(pid):
+    """True if `pid` is a python process running router.py as a router.
+
+    Checks the interpreter, not just the string: `devel-su ./router.py` has
+    router.py in its own cmdline and is our parent. --status / --down runs are
+    short-lived tools, not routers, and are left alone."""
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
+    except OSError:
+        return False
+    if not argv or not os.path.basename(argv[0]).startswith("python"):
+        return False
+    if not any(os.path.basename(a) == "router.py" for a in argv[1:]):
+        return False
+    return not ({"--status", "--down"} & set(argv))
+
+
+def other_routers():
+    """Every other live router process. Found by scanning /proc rather than
+    trusting the pid file: a crashed run, or a pre-fix one that deleted the
+    file on exit, leaves a router running that the file does not name."""
+    me = os.getpid()
+    found = []
+    for name in os.listdir("/proc"):
+        if name.isdigit() and int(name) != me and _is_router(int(name)):
+            found.append(int(name))
+    return found
+
+
+def stop_prior_router(pid=None):
+    """Stop every previous router process: SIGTERM, then SIGKILL after 10s.
+
+    On SIGTERM it exits without tearing down (see on_term in main), which is
+    what we want -- setup is about to rebuild everything it left in place.
+    They must be gone BEFORE openvpn is killed, or a surviving supervisor
+    would redial in between and leave a fresh orphan behind.
+    """
+    pids = set(other_routers())
+    if pid and pid != os.getpid() and _is_router(pid):
+        pids.add(pid)
+    if not pids:
+        return
+    STATE.log("startup: stopping previous router(s): %s"
+              % " ".join(str(p) for p in sorted(pids)))
+    for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 2)):
+        for p in pids:
+            try:
+                os.kill(p, sig)
+            except OSError:
+                pass
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            pids = {p for p in pids if _is_router(p)}
+            if not pids:
+                return
+            time.sleep(0.25)
+    STATE.log("startup: WARNING, router(s) survived SIGKILL: %s"
+              % " ".join(str(p) for p in sorted(pids)))
+
+
+def do_setup(stage=FULL_STAGE, quiet=False, prior_pid=None):
     """Bring the router up to `stage`. See STAGE_DESC.
 
     Steps marked SSH-KILLER drop the upstream link, so they only run at the
@@ -1415,6 +1483,12 @@ def do_setup(stage=FULL_STAGE, quiet=False):
         print("  %s%sBringing up the travel router — stage %d%s"
               % (C_BOLD, C_CYN, stage, C_RESET))
         print("  %s%s%s\n" % (C_DIM, STAGE_DESC.get(stage, ""), C_RESET))
+
+    # Step 0, always: nothing from a previous run may still be dialing.
+    step("fresh start: stopping any previous router, killing all openvpn")
+    stop_prior_router(prior_pid)
+    write_pid(stage)             # a pre-fix router deletes the pid file on exit
+    clear_stale_tunnel()
 
     if stage >= 2:
         step("writing AP wpa_supplicant config to /tmp")
@@ -1797,13 +1871,13 @@ def render(snap):
         out.append(row("bad", "Egress path", "via %s — NOT tunnelled" % dev))
 
     if stage < 2:
-        out.append(row("na", "IPv6 on AP", "n/a at stage %d" % stage))
+        out.append(row("na", "Disable Ipv6", "n/a at stage %d" % stage))
     elif ipv6_disabled() and v6_guard_on():
-        out.append(row("good", "IPv6 on AP", "disabled on %s · v6 forward DROP" % AP_IFACE))
+        out.append(row("good", "Disable Ipv6", "disabled on %s · v6 forward DROP" % AP_IFACE))
     elif ipv6_disabled():
-        out.append(row("warn", "IPv6 on AP", "disabled, but v6 FORWARD rule missing"))
+        out.append(row("warn", "Disable Ipv6", "disabled, but v6 FORWARD rule missing"))
     else:
-        out.append(row("bad", "IPv6 on AP", "NOT disabled on %s" % AP_IFACE))
+        out.append(row("bad", "Disable Ipv6", "NOT disabled on %s" % AP_IFACE))
 
     if stage < 2:
         out.append(row("na", "DHCP server", "not started at stage %d" % stage))
@@ -2109,17 +2183,13 @@ def main(argv):
         return cmd_down(parse_stage(argv) if "--stage" in args
                         or any(a.startswith("--stage=") for a in args) else None)
 
-    # A live router must never have setup re-run against it: do_setup flushes
-    # the FORWARD chain, which would drop the leak guard for the seconds until
-    # it is reinstalled -- while ip_forward is still 1 and the previous run's
-    # MASQUERADE rules are still live. That is exactly the leak window the
-    # design promises cannot exist.
-    pid = running_pid()
-    if pid:
-        print("Router already running (pid %d)." % pid)
-        print("  ./router.py --status   to inspect it")
-        print("  ./router.py --down     to tear it down")
-        return 1
+    # A router already running is replaced, not refused: step 0 of do_setup
+    # stops it before anything else is touched. Read its pid now, before
+    # write_pid() below overwrites the file. Replacing it does not open a leak
+    # window: the old process exits on SIGTERM without tearing down, so FORWARD
+    # stays at policy DROP, and install_leak_guard() sets the policy before it
+    # flushes.
+    prior_pid = running_pid()
 
     stage = parse_stage(argv)
     STATE.stage = stage
@@ -2138,8 +2208,6 @@ def main(argv):
 
     # An SSH drop must not take the router down with it.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
-
-    clear_stale_tunnel()
 
     write_pid(stage)
     try:
@@ -2161,7 +2229,7 @@ def main(argv):
         print("Stage %d: %s" % (stage, STAGE_DESC[stage]))
         print("First VPN dial may take up to %ds." % INIT_DIAL_TIMEOUT)
     try:
-        do_setup(stage, quiet=headless)
+        do_setup(stage, quiet=headless, prior_pid=prior_pid)
     except SetupFailed as exc:
         # Never leave a half-built router running: the AP may already be on air
         # with forwarding enabled. Undo whatever got built and exit non-zero.
@@ -2249,10 +2317,14 @@ def main(argv):
             STATE.stop.set()
             STATE.log("session ended (stopped externally)")
 
-    try:
-        os.unlink(PID_FILE)
-    except OSError:
-        pass
+    # Only if it is still ours: when a new run replaced this one, the file
+    # already names the new process, and deleting it would hide that router
+    # from --status and --down.
+    if read_pid() == os.getpid():
+        try:
+            os.unlink(PID_FILE)
+        except OSError:
+            pass
     return 0
 
 
